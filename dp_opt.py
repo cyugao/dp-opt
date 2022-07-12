@@ -1,3 +1,4 @@
+from locale import T_FMT_AMPM
 import warnings
 import matplotlib.pyplot as plt
 import scipy.linalg
@@ -8,8 +9,9 @@ import torch
 from numpy.random import default_rng
 from icecream import ic
 
-torch.manual_seed(2022)
+import wandb
 
+SEED = 2022
 
 # In[15]:
 
@@ -164,9 +166,11 @@ class DPTR(torch.optim.Optimizer):
             / opt_params["n"]
             * (self.T * opt_params["n_dim"] / rho) ** 0.5
         )
+        self.i = 0
 
     @torch.no_grad()
     def step(self, closure, hess_closure):
+        self.i += 1
         closure = torch.enable_grad()(closure)
         group = self.param_groups[0]
         hess_sensitivity = group["hess_sensitivity"]
@@ -180,7 +184,8 @@ class DPTR(torch.optim.Optimizer):
             + hess_sensitivity * self.sigma_H * self.random_symmetric_matrix(n_dim)
         )
 
-        update, dual = self.solve_qcqp(noisy_hess, noisy_grad, self.tr_radius)
+        update, dual = self.solve_qcqp(noisy_hess, noisy_grad, noisy_grad.norm())
+        # update, dual = self.solve_qcqp(noisy_hess, noisy_grad, self.tr_radius)
         param.add_(torch.from_numpy(update))
         if dual < (self.alpha * self.M) ** 0.5:
             self.complete = True
@@ -665,12 +670,31 @@ def dp_erm_training_loop(
 
 
 def dpopt_exp(
-    opt_params, initial_gap=None, rho=1, max_iter=1000, line_search=True, print_every=50
+    opt_params,
+    initial_gap=None,
+    rho=1,
+    max_iter=1000,
+    line_search=True,
+    print_every=50,
+    seed=22,
 ):
-    torch.manual_seed(22)
+    wandb.init(
+        project="dp-opt",
+        config={
+            "method": "dpopt",
+            "seed": seed,
+            "rho": rho,
+            "max_iter": max_iter,
+            "line_search": line_search,
+            "eps_g": opt_params["eps_g"],
+            "eps_H": opt_params["eps_H"],
+            "params": opt_params,
+        },
+    )
+    torch.manual_seed(seed)
     model = ERM(opt_params["n_dim"], regularizer)
     optimizer = DPOPT(model.parameters(), opt_params, line_search=line_search)
-    rng = default_rng(22)
+    rng = default_rng(seed)
     full_loss_closure = lambda: model(X, y).item()
     n = len(y)
 
@@ -716,6 +740,7 @@ def dpopt_exp(
             lambda w: model(XX, yy, w), model.w
         )
         optimizer.step(lambda: model(XX, yy), hess_closure)
+        wandb.log({"loss": loss})
         if optimizer.complete:
             print("Optimization complete!")
             break
@@ -738,15 +763,35 @@ def dpopt_exp(
     # print final loss
     print(f"Final loss: {full_loss_closure()}")
     print(optimizer.grad_evals, optimizer.hess_evals)
+    wandb.finish()
     return model, optimizer
 
 
-def tr_exp(alpha, G, M, initial_gap, rho=1, print_every=50):
-    torch.manual_seed(22)
-    model = ERM(n_dim, regularizer)
-    rng = default_rng(22)
-    full_loss_closure = lambda: model(X, y).item()
+def tr_exp(
+    alpha,
+    G,
+    M,
+    initial_gap,
+    rho=1,
+    print_every=50,
+    seed=22,
+):
     T = int(np.ceil(6 * M**0.5 * initial_gap / alpha**1.5))
+    wandb.init(
+        project="dp-opt",
+        config={
+            "method": "dptr",
+            "seed": seed,
+            "rho": rho,
+            "eps_g": opt_params["eps_g"],
+            "eps_H": opt_params["eps_H"],
+            "max_iter": T,
+        },
+    )
+    torch.manual_seed(seed)
+    rng = default_rng(seed)
+    model = ERM(n_dim, regularizer)
+    full_loss_closure = lambda: model(X, y).item()
     print(f"Optimize for at most T={T} iterations")
 
     opt_tr_params = {
@@ -780,6 +825,8 @@ def tr_exp(alpha, G, M, initial_gap, rho=1, print_every=50):
             lambda w: model(XX, yy, w), model.w
         )
         optimizer.step(lambda: model(XX, yy), hess_closure)
+        wandb.log({"loss": loss})
+
         if optimizer.complete:
             print("Optimization complete!")
             break
@@ -801,12 +848,13 @@ def tr_exp(alpha, G, M, initial_gap, rho=1, print_every=50):
     #     print(f"batch size = {batch_size}, loss: {loss:>5f}")
     # print final loss
     print(f"Final loss: {full_loss_closure()}")
+    wandb.finish()
     return model, optimizer
 
 
 # Note that the DPOPT algorithm outputs a ((1+c1)eps_g, (1+c)eps_H)-approximate second-order necessary point.
 c1, c = 0.3, 1 / 12
-eps_g, eps_H = 0.01 / (1 + c1), 0.1 / (1 + c)
+eps_g, eps_H = 0.0001 / (1 + c1), 0.01 / (1 + c)
 # eps_g, eps_H = 0.0001, 0.01
 loss_sensitivity, G, M = 1, 1, 1
 b_g, b_H = 10, 10
@@ -818,9 +866,9 @@ opt_params = dict(
 
 check_and_compute_params(opt_params)
 print_every = 10
-ls = True
-rho = 0.01
+ls = False
+rho = 0.1
 initial_gap = 0.5
 
-model, optimizer = dpopt_exp(opt_params, initial_gap=0.5, rho=rho, line_search=ls, max_iter=200, print_every=print_every,)
-model, optimizer = tr_exp(alpha=eps_g, G=1, M=1, initial_gap=initial_gap, rho=rho, print_every=print_every)
+model, optimizer = dpopt_exp(opt_params, initial_gap=initial_gap, rho=rho, line_search=ls, max_iter=500, print_every=print_every,)
+# model, optimizer = tr_exp(alpha=eps_g, G=1, M=1, initial_gap=initial_gap, rho=rho, print_every=print_every)
