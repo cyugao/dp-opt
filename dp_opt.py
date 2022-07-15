@@ -1,6 +1,8 @@
-from locale import T_FMT_AMPM
+from datetime import datetime
+import os
+import time
+
 import warnings
-import matplotlib.pyplot as plt
 import scipy.linalg
 import numpy as np
 import pandas as pd
@@ -11,7 +13,7 @@ from icecream import ic
 
 import wandb
 
-SEED = 2022
+WANDB_PROJECT = "dp-opt-exp-new"
 
 # In[15]:
 
@@ -82,8 +84,8 @@ def erm_training_loop(
     dataloader, model, optimizer, scheduler=None, epochs=3, eval_on_train=True
 ):
     size = len(dataloader.dataset)
-    for t in range(epochs):
-        print(f"\nEpoch {t+1}\n-------------------------------")
+    for i in range(epochs):
+        print(f"\nEpoch {i+1}\n-------------------------------")
         for batch, (XX, yy) in enumerate(dataloader):
             XX, yy = XX.to(device), yy.to(device)
 
@@ -145,7 +147,7 @@ class DPTR(torch.optim.Optimizer):
 
         if len(self.param_groups) != 1:
             raise ValueError(
-                "DPOPT doesn't support per-parameter options (parameter groups)"
+                "DPOPT doesn'i support per-parameter options (parameter groups)"
             )
 
         self._params = self.param_groups[0]["params"]
@@ -184,8 +186,9 @@ class DPTR(torch.optim.Optimizer):
             + hess_sensitivity * self.sigma_H * self.random_symmetric_matrix(n_dim)
         )
 
-        update, dual = self.solve_qcqp(noisy_hess, noisy_grad, noisy_grad.norm())
-        # update, dual = self.solve_qcqp(noisy_hess, noisy_grad, self.tr_radius)
+        # update, dual = self.solve_qcqp(noisy_hess, noisy_grad, noisy_grad.norm())
+        update, dual = self.solve_qcqp(noisy_hess, noisy_grad, self.tr_radius)
+        # print(f"dual: {dual:.5f}")
         param.add_(torch.from_numpy(update))
         if dual < (self.alpha * self.M) ** 0.5:
             self.complete = True
@@ -196,7 +199,7 @@ class DPTR(torch.optim.Optimizer):
         if lam1 > 0:
             x = np.linalg.solve(H, -g)
             if np.linalg.norm(x) <= r:
-                return x
+                return x, 0
 
         # First solve the following Nonsymmetric Eigenvalue Problem
         # form A = [H, -I; -gg'/r^2, H]
@@ -243,12 +246,12 @@ class DPTR(torch.optim.Optimizer):
             For real symmetric matrices, use `scipy.linalg.eigh` instead of `scipy.linalg.eig` for better performance.
 
         Returns:
-            t: the smallest eigenvalue
+            i: the smallest eigenvalue
             v: corresponding eigenvector of shape (dim, 1)
 
         """
-        t, v = scipy.linalg.eigh(H, subset_by_index=(0, 0))
-        return t[0], torch.from_numpy(v.ravel())
+        i, v = scipy.linalg.eigh(H, subset_by_index=(0, 0))
+        return i[0], torch.from_numpy(v.ravel())
 
     def random_symmetric_matrix(self, N):
         """Generate a random symmetric metrix, of which each entry is unit Gaussian noise."""
@@ -270,7 +273,7 @@ class DPOPT(torch.optim.Optimizer):
 
         if len(self.param_groups) != 1:
             raise ValueError(
-                "DPOPT doesn't support per-parameter options (parameter groups)"
+                "DPOPT doesn'i support per-parameter options (parameter groups)"
             )
 
         self._params = self.param_groups[0]["params"]
@@ -294,8 +297,8 @@ class DPOPT(torch.optim.Optimizer):
         # keep track of the RDP
         self.rdp_mech = None
         self.subsample = AmplificationBySampling(PoissonSampling=False)
-        self.grad_evals = None
-        self.hess_evals = None
+        self.grad_evals = 0
+        self.hess_evals = 0
 
     @torch.no_grad()
     def step(self, closure, hess_closure):
@@ -350,12 +353,6 @@ class DPOPT(torch.optim.Optimizer):
         # print(grad_sensitivity * self.sigma_g)
         noisy_grad = param.grad + grad_sensitivity * self.sigma_g * torch.randn(n_dim)
         noisy_grad_norm = noisy_grad.norm()
-        # ic(param.grad.norm(), grad_sensitivity * self.sigma_g, noisy_grad_norm)
-        # input()
-        # ic()
-        # breakpoint()
-
-        # print(noisy_grad.norm())
         w_init = param.clone(memory_format=torch.contiguous_format)
 
         def step_closure(closure, direction, gamma):
@@ -399,27 +396,27 @@ class DPOPT(torch.optim.Optimizer):
                 hess_closure()
                 + hess_sensitivity * self.sigma_H * self.random_symmetric_matrix(n_dim)
             )
-            t, v = self.smallest_eig(noisy_hess)
+            i, v = self.smallest_eig(noisy_hess)
             self.hess_evals += 1
 
-            if t > -eps_H:
+            if i > -eps_H:
                 self.complete = True
                 return
 
             # Negative curvature step
             if not self.line_search:
-                param.add_(v, alpha=2 * -t / M)
+                param.add_(v, alpha=2 * -i / M)
                 return
 
             # Backtracking line search
-            gamma_H_init = self.gamma_H_init_scalar * -t
+            gamma_H_init = self.gamma_H_init_scalar * -i
 
             closure_qH = (
                 lambda gamma: loss
                 - step_closure(closure, v, gamma)
-                - 0.5 * c_H * gamma * gamma * -t
+                - 0.5 * c_H * gamma * gamma * -i
             )
-            qH_sensitivity = self.qH_scalar * -t
+            qH_sensitivity = self.qH_scalar * -i
 
             gamma = self.svt_line_search(
                 closure_qH,
@@ -460,12 +457,12 @@ class DPOPT(torch.optim.Optimizer):
             For real symmetric matrices, use `scipy.linalg.eigh` instead of `scipy.linalg.eig` for better performance.
 
         Returns:
-            t: the smallest eigenvalue
+            i: the smallest eigenvalue
             v: corresponding eigenvector of shape (dim, 1)
 
         """
-        t, v = scipy.linalg.eigh(H, subset_by_index=(0, 0))
-        return t[0], torch.from_numpy(v.ravel())
+        i, v = scipy.linalg.eigh(H, subset_by_index=(0, 0))
+        return i[0], torch.from_numpy(v.ravel())
 
     def random_symmetric_matrix(self, N):
         """Generate a random symmetric metrix, of which each entry is unit Gaussian noise."""
@@ -490,8 +487,8 @@ class DPOPT(torch.optim.Optimizer):
         return compose([gm_grad, gm_hess], [self.grad_evals, self.hess_evals])
 
     def new_epoch(self, sigma_g, sigma_H, lambda_svt):
-        self.grad_evals = 0
-        self.hess_evals = 0
+        # self.grad_evals = 0
+        # self.hess_evals = 0
         self.sigma_g = sigma_g
         self.sigma_H = sigma_H
         self.lambda_svt = lambda_svt
@@ -601,10 +598,10 @@ def dp_erm_training_loop(
     batch_frac = 0.5
     mech = None
 
-    for t in range(epochs):
+    for i in range(epochs):
 
         est_T = dp_estimate_T(full_loss_closure, opt_params, sigma_f)
-        # mech_full = gm_f if t == 0 else compose([gm_f, mech], [t + 1, 1])
+        # mech_full = gm_f if i == 0 else compose([gm_f, mech], [i + 1, 1])
         # eps_alphas = get_rdp(mech_full, alphas)
         # print(f"eps: {eps_alphas[:5]} for gamma={alphas[:5]}")
 
@@ -616,7 +613,7 @@ def dp_erm_training_loop(
         optimizer.new_epoch(sigma_g, sigma_H, lambda_svt)
         # T = est_T // 4
         T = 10
-        print(f"Epoch {t+1}: {T} iterations \n-------------------------------")
+        print(f"Epoch {i+1}: {T} iterations \n-------------------------------")
         for i in range(T):
             indices = rng.choice(n, size=batch_size)
             XX, yy = X[indices], y[indices]
@@ -640,7 +637,7 @@ def dp_erm_training_loop(
         # print(batch_frac)
         # mech_t = optimizer.compose_rdp(batch_frac)
         # mechanism_lst.append(mech_t)
-        # mech = mech_t if t == 0 else compose([mech, mech_t], [1, 1])
+        # mech = mech_t if i == 0 else compose([mech, mech_t], [1, 1])
 
         # loss, loss.item()
         if eval_on_train:
@@ -650,7 +647,7 @@ def dp_erm_training_loop(
             )
         else:
             print(f"batch size = {batch_size}, loss: {loss:>5f}")
-    # mech_full = compose([gm_f, mech], [t + 1, 1])
+    # mech_full = compose([gm_f, mech], [i + 1, 1])
     # return mechanism_lst, mech_full
 
 
@@ -674,29 +671,34 @@ def dpopt_exp(
     initial_gap=None,
     rho=1,
     max_iter=1000,
+    init_T=500,
     line_search=True,
     print_every=50,
     seed=22,
+    wandb_on=True,
 ):
+    n = len(y)
     wandb.init(
-        project="dp-opt",
+        project=WANDB_PROJECT,
+        group=f"eps_g={eps_g_target},seed={seed}",
         config={
             "method": "dpopt",
             "seed": seed,
             "rho": rho,
+            "eps": rdp2dp(rho, 1 / n),
             "max_iter": max_iter,
             "line_search": line_search,
             "eps_g": opt_params["eps_g"],
             "eps_H": opt_params["eps_H"],
             "params": opt_params,
         },
+        mode="online" if wandb_on else "disabled",
     )
     torch.manual_seed(seed)
     model = ERM(opt_params["n_dim"], regularizer)
     optimizer = DPOPT(model.parameters(), opt_params, line_search=line_search)
     rng = default_rng(seed)
     full_loss_closure = lambda: model(X, y).item()
-    n = len(y)
 
     # gm_f = ExactGaussianMechanism(sigma_f / opt_params["loss_sensitivity"], name="GM_f")
     # gm_f.replace_one = True
@@ -704,14 +706,17 @@ def dpopt_exp(
 
     # batch_frac = 0.5
     # mech = None
-
-    sigma_f = ((100 + 1) / (2 * rho)) ** 0.5
+    rho_f = rho / max_iter
+    sigma_f = (1 / (2 * rho_f)) ** 0.5
+    sigma_f_unscaled = sigma_f * opt_params["f_sensitivity"]
     print(f"sigma_f: {sigma_f}")
     est_T = dp_estimate_T(full_loss_closure, opt_params, sigma_f, rng, gap=initial_gap)
-    sigma_g = sigma_H = lambda_svt = (3 * (est_T + 1) / (2 * rho)) ** 0.5
-
+    rho -= rho_f
     print(f"Estimated T={est_T}")
-    # mech_full = gm_f if t == 0 else compose([gm_f, mech], [t + 1, 1])
+    # exit()
+    T = est_T
+
+    # mech_full = gm_f if i == 0 else compose([gm_f, mech], [i + 1, 1])
     # eps_alphas = get_rdp(mech_full, alphas)
     # print(f"eps: {eps_alphas[:5]} for gamma={alphas[:5]}")
 
@@ -720,36 +725,89 @@ def dpopt_exp(
     # batch_size = 5000
     # batch_frac = batch_size / n
 
-    optimizer.new_epoch(sigma_g, sigma_H, lambda_svt)
     # T = est_T // 4
-    # t = 0
-    # print(f"Epoch {t+1}: {T} iterations \n-------------------------------")
-    for i in range(max_iter):
-        # indices = rng.choice(n, size=batch_size)
-        # XX, yy = X[indices], y[indices]
-        # XX, yy = XX.to(device), yy.to(device)
-        XX, yy = X, y
+    # i = 0
+    # print(f"Epoch {i+1}: {T} iterations \n-------------------------------")
+    t0 = max_iter
+    flag = True
 
-        # Compute prediction error
-        loss = model(XX, yy)
+    i = 0  # global iteration counter
+    min_T = T**0.5
+    # measure running time
+    start = time.perf_counter()
+    while not optimizer.complete and i < max_iter:
+        prev_noisy_loss = None
+        rho_0 = rho / (T + 1)
+        sigma_f = sigma_g = sigma_H = lambda_svt = (1 / (2 * rho_0 / 4)) ** 0.5
+        optimizer.new_epoch(sigma_g, sigma_H, lambda_svt)
+        if T < min_T:
+            max_T = T
+            flag = True
+        else:
+            max_T = T // 4
+            flag = False
+        for i in range(min(max_T, max_iter - i)):
+            i += 1
+            # indices = rng.choice(n, size=batch_size)
+            # XX, yy = X[indices], y[indices]
+            # XX, yy = XX.to(device), yy.to(device)
 
-        # Backpropagation
-        optimizer.zero_grad()
-        loss.backward()
-        hess_closure = lambda: torch.autograd.functional.hessian(
-            lambda w: model(XX, yy, w), model.w
-        )
-        optimizer.step(lambda: model(XX, yy), hess_closure)
-        wandb.log({"loss": loss})
-        if optimizer.complete:
-            print("Optimization complete!")
-            break
-        if i % print_every == 0:
-            print(f"Iteration {i}: {loss.item():>.5f}")
+            # TODO: update rho (privacy budget) correctly
+            XX, yy = X, y
+
+            # Compute prediction error
+            loss = model(XX, yy)
+            noisy_loss = (
+                loss + rng.normal(0, sigma_f * opt_params["f_sensitivity"])
+            ).item()
+            if i % print_every == 0:
+                print(f"Iteration {i}: {loss.item():>.5f}")
+                # if i < t0:
+                # check if the loss is increasing to previous iteration
+                # TODO: consider setting a more reasonable threshold using MIN_DECREASE
+            # Backpropagation
+            optimizer.zero_grad()
+            loss.backward()
+            hess_closure = lambda: torch.autograd.functional.hessian(
+                lambda w: model(XX, yy, w), model.w
+            )
+            optimizer.step(lambda: model(XX, yy), hess_closure)
+            wandb.log({"loss": loss})
+            wandb.log({"grad_norm": model.w.grad.norm()})
+
+            if optimizer.complete:
+                print("Optimization complete!")
+                break
+            if (
+                prev_noisy_loss is not None
+                and noisy_loss > prev_noisy_loss + 4 * sigma_f_unscaled
+            ):
+                print(f"With T={T}, loss is increasing. Shrink T to {T // 4}")
+
+                rho_prev = rho
+                rho *= 1 - (i + 1) / T
+                T //= 4
+                # print change of rho
+                print(f"Privacy budget change: rho={rho_prev:.5f} -> {rho:.5f}")
+                break
+            else:
+                prev_noisy_loss = noisy_loss
+        else:
+            if flag:
+                rho = 0
+                break
+            print(f"1/4 of the budget used. Shrink T={T} to {T // 4}")
+            rho_prev = rho
+            rho *= 1 - (i + 1) / T
+            print(f"Privacy budget change: rho={rho_prev:.5f} -> {rho:.5f}")
+            T //= 4
+    end = time.perf_counter()
+    runtime = end - start
+    print(f"Running time: {runtime:.2f}s")
     # print(batch_frac)
     # mech_t = optimizer.compose_rdp(batch_frac)
     # mechanism_lst.append(mech_t)
-    # mech = mech_t if t == 0 else compose([mech, mech_t], [1, 1])
+    # mech = mech_t if i == 0 else compose([mech, mech_t], [1, 1])
     # train_loss = full_loss_closure()
     # print("loss: {loss:>5f}, loss on the whole dataset: {train_loss:>5f}")
     # loss, loss.item()
@@ -761,10 +819,18 @@ def dpopt_exp(
     # else:
     #     print(f"batch size = {batch_size}, loss: {loss:>5f}")
     # print final loss
-    print(f"Final loss: {full_loss_closure()}")
+    grad_norm = model.w.grad.norm()
+    print(
+        f"Final loss: {loss:.5f}, grad_norm: {grad_norm:.5f}, privacy budget left: {rho:.5f}"
+    )
     print(optimizer.grad_evals, optimizer.hess_evals)
+    # store loss, grad_norm, runtime in dictionary
+    results = dict(
+        loss=loss, grad_norm=grad_norm, runtime=runtime, rho_left=rho, num_iter=i
+    )
+    wandb.run.summary.update(results)
     wandb.finish()
-    return model, optimizer
+    return model, optimizer, results
 
 
 def tr_exp(
@@ -775,23 +841,27 @@ def tr_exp(
     rho=1,
     print_every=50,
     seed=22,
+    wandb_on=True,
 ):
     T = int(np.ceil(6 * M**0.5 * initial_gap / alpha**1.5))
     wandb.init(
-        project="dp-opt",
+        project=WANDB_PROJECT,
+        group=f"eps_g={eps_g_target},seed={seed}",
         config={
             "method": "dptr",
             "seed": seed,
             "rho": rho,
+            "eps": rdp2dp(rho, 1 / n),
             "eps_g": opt_params["eps_g"],
             "eps_H": opt_params["eps_H"],
             "max_iter": T,
         },
+        mode="online" if wandb_on else "disabled",
     )
     torch.manual_seed(seed)
     rng = default_rng(seed)
     model = ERM(n_dim, regularizer)
-    full_loss_closure = lambda: model(X, y).item()
+    # full_loss_closure = lambda: model(X, y).item()
     print(f"Optimize for at most T={T} iterations")
 
     opt_tr_params = {
@@ -808,7 +878,7 @@ def tr_exp(
     optimizer = DPTR(model.parameters(), opt_tr_params, rho=rho)
     # batch_size = 5000
     # batch_frac = batch_size / n
-
+    start = time.perf_counter()
     for i in range(T):
         # indices = rng.choice(n, size=batch_size)
         # XX, yy = X[indices], y[indices]
@@ -826,35 +896,37 @@ def tr_exp(
         )
         optimizer.step(lambda: model(XX, yy), hess_closure)
         wandb.log({"loss": loss})
+        wandb.log({"grad_norm": model.w.grad.norm()})
 
         if optimizer.complete:
             print("Optimization complete!")
             break
         if i % print_every == 0:
             print(f"Iteration {i}: {loss.item():.5f}")
-    # print(batch_frac)
-    # mech_t = optimizer.compose_rdp(batch_frac)
-    # mechanism_lst.append(mech_t)
-    # mech = mech_t if t == 0 else compose([mech, mech_t], [1, 1])
-    # train_loss = full_loss_closure()
-    # print("loss: {loss:>5f}, loss on the whole dataset: {train_loss:>5f}")
-    # loss, loss.item()
-    # if eval_on_train:
-    #     train_loss = full_loss_closure()
-    #     print(
-    #         f"batch size = {batch_size}, loss: {loss:>5f}, loss on the whole dataset: {train_loss:>5f}"
-    #     )
-    # else:
-    #     print(f"batch size = {batch_size}, loss: {loss:>5f}")
-    # print final loss
-    print(f"Final loss: {full_loss_closure()}")
+    end = time.perf_counter()
+    runtime = end - start
+    print(f"Running time: {runtime:.2f}s")
+    grad_norm = model.w.grad.norm()
+    print(
+        f"Final loss: {loss:.5f}, grad_norm: {grad_norm:.5f}, privacy budget left: {rho:.5f}"
+    )
+    results = dict(
+        loss=loss,
+        grad_norm=grad_norm,
+        runtime=runtime,
+        rho_left=rho * i / T,
+        num_iter=i,
+    )
+    wandb.run.summary.update(results)
     wandb.finish()
-    return model, optimizer
+    return model, optimizer, results
 
 
 # Note that the DPOPT algorithm outputs a ((1+c1)eps_g, (1+c)eps_H)-approximate second-order necessary point.
 c1, c = 0.3, 1 / 12
-eps_g, eps_H = 0.0001 / (1 + c1), 0.01 / (1 + c)
+# eps_g, eps_H = 0.1 / (1 + c1), 0.316 / (1 + c)
+eps_g_target = 0.01
+eps_g, eps_H = eps_g_target / (1 + c1), eps_g_target**0.5 / (1 + c)
 # eps_g, eps_H = 0.0001, 0.01
 loss_sensitivity, G, M = 1, 1, 1
 b_g, b_H = 10, 10
@@ -866,9 +938,54 @@ opt_params = dict(
 
 check_and_compute_params(opt_params)
 print_every = 10
-ls = False
-rho = 0.1
 initial_gap = 0.5
+def dp2rdp(eps, delta):
+    i = np.log(1/delta)
+    return (np.sqrt(eps + i) - np.sqrt(i)) ** 2
 
-model, optimizer = dpopt_exp(opt_params, initial_gap=initial_gap, rho=rho, line_search=ls, max_iter=500, print_every=print_every,)
-# model, optimizer = tr_exp(alpha=eps_g, G=1, M=1, initial_gap=initial_gap, rho=rho, print_every=print_every)
+def rdp2dp(rho, delta):
+    # reverse
+    i = np.log(1/delta)
+    return (rho ** 0.5 + np.sqrt(i)) ** 2 - i
+
+eps_lst = np.arange(0.1, 2.1, 0.2)
+# eps_lst = np.array([0.1, 0.5, 1.0])
+rhos = dp2rdp(eps_lst, 1 / n)
+# rho2rdp_map = dict(zip(rhos, eps_lst))
+# print(f"eps={eps:.2f}, rho={rho:.5f}")
+
+ls = False
+wandb_on = True
+SEED = 21
+
+def exp_range_eps():
+    time_str = datetime.now().strftime("%m%d-%H%M%S")
+    output_file = open(os.path.join("results", f"result-eps_g={eps_g:.4f}_{time_str}.csv"), 'w')
+    output_file.write("method,eps,rho,loss,grad_norm,runtime,rho_left,num_iter\n")
+
+    for eps, rho in zip(eps_lst, rhos):
+        for ls in [True, False]:
+            method = "DPOPT-LS" if ls else "DPOPT"
+            print(f">>>>>\n Running {method} with rho={rho:.5f} (eps={eps:.2f})")
+            model, optimizer, results = dpopt_exp(opt_params, initial_gap=initial_gap, rho=rho, line_search=ls, max_iter=2000, init_T=10000, print_every=print_every, seed=SEED, wandb_on=wandb_on)
+            print("")
+            print("<<<<<")
+            # write result to file
+            output_file.write(f"{method},{eps:.4f},{rho:.5f},{results['loss']:.5f},{results['grad_norm']:.5f},{results['runtime']:.5f},{results['rho_left']:.5f},{results['num_iter']}\n")
+    # model, optimizer = tr_exp(alpha=eps_g, G=1, M=1, initial_gap=initial_gap, rho=rho, print_every=print_every, wandb_on=wandb_on)
+    print("Running DPTR...")
+    for eps, rho in zip(eps_lst, rhos):
+        method = "DPTR"
+        print(f">>>>>\n Running {method} with rho={rho:.5f} (eps={eps:.2f})")
+        model, optimizer, results = tr_exp(alpha=eps_g_target, G=1, M=1, initial_gap=initial_gap, rho=rho, print_every=print_every, wandb_on=wandb_on)
+        print("")
+        print("<<<<<")
+        # write result to file
+        output_file.write(f"{method},{eps:.4f},{rho:.5f},{results['loss']:.5f},{results['grad_norm']:.5f},{results['runtime']:.5f}, {results['rho_left']:.5f},{results['num_iter']}\n")
+
+    output_file.close()
+
+exp_range_eps()
+# %%
+# rho = .1
+# model, optimizer, results = tr_exp(alpha=eps_g_target, G=1, M=1, initial_gap=initial_gap, rho=rho, print_every=print_every, wandb_on=wandb_on)
