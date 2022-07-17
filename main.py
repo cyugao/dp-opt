@@ -7,9 +7,12 @@ import scipy.linalg
 import numpy as np
 import pandas as pd
 from torch.distributions.laplace import Laplace
-import torch
 from numpy.random import default_rng
 from icecream import ic
+import torch
+
+from DPTR import DPTR
+from DPOPT import DPOPT
 
 import wandb
 
@@ -60,12 +63,6 @@ class ERM(torch.nn.Module):
             torch.exp(-y * (X @ w))
         ).mean() + self.reg_coef * self.regularizer(w)
 
-    # def string(self):
-    #     """
-    #     Just like any class in Python, you can also define custom method on PyTorch modules
-    #     """
-    #     return f'loss = {self.w.item()} + {self.b.item()} x + {self.c.item()} x^2 + {self.d.item()} x^3'
-
 
 # In[20]:
 
@@ -108,397 +105,6 @@ def erm_training_loop(
                     print(f"loss: {loss:>5f} [{current:>5d}/{size:>5d}]")
         if scheduler:
             scheduler.step
-
-
-# ### Helper Functions
-
-# ## DPOPT
-
-# For RDP, eps is a function of gamma $$\varepsilon=\varepsilon(\gamma)$$
-
-# ## Quick example of autodp
-
-
-from autodp.mechanism_zoo import ExactGaussianMechanism, PureDP_Mechanism
-from autodp.transformer_zoo import Composition, ComposeGaussian, AmplificationBySampling
-
-
-# In[164]:
-
-# gm_grad = ExactGaussianMechanism(0.1, name="GM_grad")
-# gm_hess = ExactGaussianMechanism(0.2, name="GM_hess")
-# subsample = AmplificationBySampling(PoissonSampling=False)
-# SVT = PureDP_Mechanism(eps=0.1, name="SVT_line_search")
-# compose = Composition()
-
-
-# In[221]:
-class DPTR(torch.optim.Optimizer):
-
-    """Differentially Private Optimization Algorithm"""
-
-    def __init__(self, params, opt_params, rho=1, use_mini_batch=True):
-
-        # defaults = dict(grad_sigma=grad_sigma, hess_sigma=hess_sigma, eps_g=eps_g, eps_H=eps_H, n_dim=n_dim,
-        #                 c=c, c1=c1, c2=c2)
-        # if nesterov and (momentum <= 0 or dampening != 0):
-        #     raise ValueError("Nesterov momentum requires a momentum and zero dampening")
-        super(DPTR, self).__init__(params, opt_params)
-
-        if len(self.param_groups) != 1:
-            raise ValueError(
-                "DPOPT doesn'i support per-parameter options (parameter groups)"
-            )
-
-        self._params = self.param_groups[0]["params"]
-        self.complete = False
-        self.rdp_accountant = 0
-        self.mini_batch = use_mini_batch
-        self.T = opt_params["T"]
-        # sigma_g = 2G / n * sqrt(T/phi)
-        self.alpha = opt_params["alpha"]
-        self.M = opt_params["M"]
-        self.n_dim = opt_params["n_dim"]
-        self.I = np.eye(self.n_dim)
-        self.tr_radius = opt_params["alpha"] / opt_params["M"]
-        self.sigma_g = 2 * opt_params["G"] / opt_params["n"] * (self.T / rho) ** 0.5
-        self.sigma_H = (
-            2
-            * opt_params["M"]
-            / opt_params["n"]
-            * (self.T * opt_params["n_dim"] / rho) ** 0.5
-        )
-        self.i = 0
-
-    @torch.no_grad()
-    def step(self, closure, hess_closure):
-        self.i += 1
-        closure = torch.enable_grad()(closure)
-        group = self.param_groups[0]
-        hess_sensitivity = group["hess_sensitivity"]
-        grad_sensitivity = group["grad_sensitivity"]
-
-        param = self._params[0]
-        orig_loss = closure()
-        noisy_grad = param.grad + grad_sensitivity * self.sigma_g * torch.randn(n_dim)
-        noisy_hess = (
-            hess_closure()
-            + hess_sensitivity * self.sigma_H * self.random_symmetric_matrix(n_dim)
-        )
-
-        # update, dual = self.solve_qcqp(noisy_hess, noisy_grad, noisy_grad.norm())
-        update, dual = self.solve_qcqp(noisy_hess, noisy_grad, self.tr_radius)
-        # print(f"dual: {dual:.5f}")
-        param.add_(torch.from_numpy(update))
-        if dual < (self.alpha * self.M) ** 0.5:
-            self.complete = True
-
-    def solve_qcqp(self, H, g, r):
-        # if positive definite, check the easy case
-        lam1, _ = self.smallest_eig(H)
-        if lam1 > 0:
-            x = np.linalg.solve(H, -g)
-            if np.linalg.norm(x) <= r:
-                return x, 0
-
-        # First solve the following Nonsymmetric Eigenvalue Problem
-        # form A = [H, -I; -gg'/r^2, H]
-        n_dim = H.shape[0]
-        A = np.concatenate(
-            (
-                np.concatenate((H, -np.identity(n_dim)), axis=1),
-                np.concatenate((-np.outer(g, g) / r**2, H), axis=1),
-            ),
-            axis=0,
-        )
-        w, v = np.linalg.eig(A)
-        # get the minimum real eigenvalue in w
-        lam = w[np.isreal(w)].real.min()
-        lam = -lam
-        # solve (H+lam*I)x = -g
-        if lam1 > lam:
-            # hard case
-            warnings.warn(f"lam1={lam1:1.2f} > lam={lam:.4f}, hard case!")
-        x = np.linalg.solve(H + lam * np.identity(n_dim), -g)
-        return x, lam
-
-    # def solve_qcqp(self, H, g, r):
-    #     x = cp.Variable(self.n_dim)
-    #     r2 = r * r
-    #     constraint = 0.5 * cp.quad_form(x, self.I) <= 0.5 * r2
-    #     p = cp.Problem(
-    #         cp.Minimize(0.5 * cp.quad_form(x, H) + g.T @ x),
-    #         [constraint],
-    #     )
-    #     # [cp.atoms.pnorm(vec(x), 2) <= r])
-    #     primal_result = p.solve()
-
-    #     if p.status is not cp.OPTIMAL:
-    #         raise ValueError("Failed to solve the subproblem")
-
-    #     # return solution and dual
-    #     return x.value, constraint.dual_value
-
-    def smallest_eig(self, H):
-        """Compute the smallest (eigenvalue, eigenvector) pair of a complex Hermitian or real symmetric matrix.
-
-        Note:
-            For real symmetric matrices, use `scipy.linalg.eigh` instead of `scipy.linalg.eig` for better performance.
-
-        Returns:
-            i: the smallest eigenvalue
-            v: corresponding eigenvector of shape (dim, 1)
-
-        """
-        i, v = scipy.linalg.eigh(H, subset_by_index=(0, 0))
-        return i[0], torch.from_numpy(v.ravel())
-
-    def random_symmetric_matrix(self, N):
-        """Generate a random symmetric metrix, of which each entry is unit Gaussian noise."""
-        a = torch.randn(N, N)
-        return torch.tril(a) + torch.tril(a, -1).T
-
-
-class DPOPT(torch.optim.Optimizer):
-
-    """Differentially Private Optimization Algorithm"""
-
-    def __init__(self, params, opt_params, use_mini_batch=True, line_search=True):
-
-        # defaults = dict(grad_sigma=grad_sigma, hess_sigma=hess_sigma, eps_g=eps_g, eps_H=eps_H, n_dim=n_dim,
-        #                 c=c, c1=c1, c2=c2)
-        # if nesterov and (momentum <= 0 or dampening != 0):
-        #     raise ValueError("Nesterov momentum requires a momentum and zero dampening")
-        super(DPOPT, self).__init__(params, opt_params)
-
-        if len(self.param_groups) != 1:
-            raise ValueError(
-                "DPOPT doesn'i support per-parameter options (parameter groups)"
-            )
-
-        self._params = self.param_groups[0]["params"]
-        self.complete = False
-        self.rdp_accountant = 0
-        self.mini_batch = use_mini_batch
-        self.line_search = line_search
-        self.gamma_g_init = opt_params["b_g"] * opt_params["gamma_g_bar"]
-        self.qg_scalar = 2 / opt_params["n"] * self.gamma_g_init * opt_params["G"]
-        self.gamma_H_init_scalar = (
-            opt_params["b_H"] * opt_params["t2"] / opt_params["M"]
-        )
-        self.qH_scalar = (
-            opt_params["b_H"]
-            * 2
-            / opt_params["n"]
-            * self.gamma_g_init
-            * opt_params["G"]
-        )
-
-        # keep track of the RDP
-        self.rdp_mech = None
-        self.subsample = AmplificationBySampling(PoissonSampling=False)
-        self.grad_evals = 0
-        self.hess_evals = 0
-
-    @torch.no_grad()
-    def step(self, closure, hess_closure):
-        """Performs a single optimization step.
-
-        Args:
-            closure (callable): A closure that reevaluates the model
-                and returns the loss.
-            hess_closure: A closure that reevaluates the hessian
-        """
-        loss = None
-        # count number of iterations
-        # count gradient steps and neg curvature steps
-        # mechanism_list = []
-        # Make sure the closure is always called with grad enabled
-        closure = torch.enable_grad()(closure)
-        group = self.param_groups[0]
-        eps_g = group["eps_g"]
-        eps_H = group["eps_H"]
-        n_dim = group["n_dim"]
-        c_g = group["c_g"]
-        c_H = group["c_H"]
-        # c = group["c"]
-        # c1 = group["c1"]
-        # c2 = group["c2"]
-        gamma_g_init = self.gamma_g_init
-        gamma_g_bar = group["gamma_g_bar"]
-        beta_g = group["beta_g"]
-        beta_H = group["beta_H"]
-        G = group["G"]
-        M = group["M"]
-        grad_sensitivity = group["grad_sensitivity"]
-        hess_sensitivity = group["hess_sensitivity"]
-
-        # NOTE: LBFGS has only global state, but we register it as state for
-        # the first param, because this helps with casting in load_state_dict
-        # state = self.state[param]
-        # state.setdefault('func_evals', 0)
-        # state.setdefault('n_iter', 0)
-
-        # evaluate initial f(x)
-        param = self._params[0]
-        orig_loss = closure()
-        loss = float(orig_loss)
-        # current_evals = 1
-        # state['func_evals'] += 1
-
-        # flat_grad = self._gather_flat_grad()
-        self.grad_evals += 1
-        # breakpoint()
-
-        # print(grad_sensitivity * self.sigma_g)
-        noisy_grad = param.grad + grad_sensitivity * self.sigma_g * torch.randn(n_dim)
-        noisy_grad_norm = noisy_grad.norm()
-        w_init = param.clone(memory_format=torch.contiguous_format)
-
-        def step_closure(closure, direction, gamma):
-            """
-            Args:
-                closure: A closure that reevaluates the model
-                    and returns the loss.
-                direction: The direction to take the step
-                gamma: The step size
-            """
-            param.copy_(w_init + gamma * direction)
-            return float(closure())
-
-        if noisy_grad_norm > eps_g:
-            # Gradient step
-            if not self.line_search:
-                param.add_(noisy_grad, alpha=-1 / G)
-                return
-            # Backtracking line search
-            qg_sensitivity = self.qg_scalar * noisy_grad_norm
-
-            closure_qg = (
-                lambda gamma: loss
-                - step_closure(closure, -noisy_grad, gamma)
-                - c_g * gamma * noisy_grad_norm * noisy_grad_norm
-            )
-
-            gamma = self.svt_line_search(
-                closure_qg,
-                qg_sensitivity,
-                beta_g,
-                gamma_g_init,
-                gamma_g_bar,
-                self.lambda_svt,
-            )
-            # ic(gamma)
-            param.copy_(w_init - gamma * noisy_grad)
-        else:
-            print("curvature step")
-            noisy_hess = (
-                hess_closure()
-                + hess_sensitivity * self.sigma_H * self.random_symmetric_matrix(n_dim)
-            )
-            i, v = self.smallest_eig(noisy_hess)
-            self.hess_evals += 1
-
-            if i > -eps_H:
-                self.complete = True
-                return
-
-            # Negative curvature step
-            if not self.line_search:
-                param.add_(v, alpha=2 * -i / M)
-                return
-
-            # Backtracking line search
-            gamma_H_init = self.gamma_H_init_scalar * -i
-
-            closure_qH = (
-                lambda gamma: loss
-                - step_closure(closure, v, gamma)
-                - 0.5 * c_H * gamma * gamma * -i
-            )
-            qH_sensitivity = self.qH_scalar * -i
-
-            gamma = self.svt_line_search(
-                closure_qH,
-                qH_sensitivity,
-                beta_H,
-                gamma_H_init,
-                gamma_g_bar,
-                self.lambda_svt,
-            )
-            param.copy_(w_init + gamma * v)
-
-        # accumulate RDP
-        # self.mech = compose(mechanism_list, coeff_list, RDP_compose_only=True)
-
-    def svt_line_search(
-        self, closure_q, q_sensitivity, beta, gamma_init, gamma_bar, lambda_svt
-    ):
-        """
-        Performs a line search on the given closure
-        """
-        gamma = gamma_init
-        xi = Laplace(0, 2 * lambda_svt * q_sensitivity).sample()
-        i_max = int(np.ceil(np.log(gamma_bar / gamma_init) / np.log(beta)))
-
-        lap = Laplace(0, 4 * lambda_svt * q_sensitivity)
-        for _ in range(i_max):
-            q = closure_q(gamma) + lap.sample()
-            if q > xi:
-                return gamma
-            gamma = gamma * beta
-
-        return gamma_bar
-
-    def smallest_eig(self, H):
-        """Compute the smallest (eigenvalue, eigenvector) pair of a complex Hermitian or real symmetric matrix.
-
-        Note:
-            For real symmetric matrices, use `scipy.linalg.eigh` instead of `scipy.linalg.eig` for better performance.
-
-        Returns:
-            i: the smallest eigenvalue
-            v: corresponding eigenvector of shape (dim, 1)
-
-        """
-        i, v = scipy.linalg.eigh(H, subset_by_index=(0, 0))
-        return i[0], torch.from_numpy(v.ravel())
-
-    def random_symmetric_matrix(self, N):
-        """Generate a random symmetric metrix, of which each entry is unit Gaussian noise."""
-        a = torch.randn(N, N)
-        return torch.tril(a) + torch.tril(a, -1).T
-
-    def compose_rdp(self, frac=0.5):
-        gm_grad = ExactGaussianMechanism(
-            self.sigma_g / self.grad_sensitivity, name="GM_grad"
-        )
-        gm_hess = ExactGaussianMechanism(
-            self.sigma_H / self.hess_sensitivity, name="GM_hess"
-        )
-        SVT = PureDP_Mechanism(eps=0.1, name="SVT_line_search")  # TODO fix this
-        gm_grad.replace_one = True
-        gm_hess.replace_one = True
-
-        if self.mini_batch:
-            gm_grad = subsample(gm_grad, frac, improved_bound_flag=True)
-            gm_hess = subsample(gm_hess, frac, improved_bound_flag=True)
-
-        return compose([gm_grad, gm_hess], [self.grad_evals, self.hess_evals])
-
-    def new_epoch(self, sigma_g, sigma_H, lambda_svt):
-        # self.grad_evals = 0
-        # self.hess_evals = 0
-        self.sigma_g = sigma_g
-        self.sigma_H = sigma_H
-        self.lambda_svt = lambda_svt
-
-
-#     def accumulate_gaussian_rdp(self, sigma, sensitivity):
-#         self.rdp_accountant += 0.5 * (sensitivity / sigma) ** 2
-
-#     def get_rdp_accountant(self):
-#         return self.rdp_accountant
 
 
 def check_and_compute_params(opt_params):
@@ -590,9 +196,6 @@ def dp_erm_training_loop(
     full_loss_closure = lambda: model(X, y).item()
     n = len(y)
     sigma_f = 0.1  # TODO determine this
-
-    gm_f = ExactGaussianMechanism(sigma_f / opt_params["loss_sensitivity"], name="GM_f")
-    gm_f.replace_one = True
     mechanism_lst = []
 
     batch_frac = 0.5
@@ -948,17 +551,12 @@ def rdp2dp(rho, delta):
     i = np.log(1/delta)
     return (rho ** 0.5 + np.sqrt(i)) ** 2 - i
 
-eps_lst = np.arange(0.1, 2.1, 0.2)
-# eps_lst = np.array([0.1, 0.5, 1.0])
-rhos = dp2rdp(eps_lst, 1 / n)
 # rho2rdp_map = dict(zip(rhos, eps_lst))
 # print(f"eps={eps:.2f}, rho={rho:.5f}")
 
-ls = False
-wandb_on = True
-SEED = 21
-
-def exp_range_eps():
+def exp_range_eps(eps_lst, rhos=None, wandb_on=True, seed=21):
+    if rhos is None:
+        rhos = dp2rdp(eps_lst, 1 / n)
     time_str = datetime.now().strftime("%m%d-%H%M%S")
     output_file = open(os.path.join("results", f"result-eps_g={eps_g:.4f}_{time_str}.csv"), 'w')
     output_file.write("method,eps,rho,loss,grad_norm,runtime,rho_left,num_iter\n")
@@ -967,7 +565,7 @@ def exp_range_eps():
         for ls in [True, False]:
             method = "DPOPT-LS" if ls else "DPOPT"
             print(f">>>>>\n Running {method} with rho={rho:.5f} (eps={eps:.2f})")
-            model, optimizer, results = dpopt_exp(opt_params, initial_gap=initial_gap, rho=rho, line_search=ls, max_iter=2000, init_T=10000, print_every=print_every, seed=SEED, wandb_on=wandb_on)
+            model, optimizer, results = dpopt_exp(opt_params, initial_gap=initial_gap, rho=rho, line_search=ls, max_iter=2000, init_T=10000, print_every=print_every, seed=seed, wandb_on=wandb_on)
             print("")
             print("<<<<<")
             # write result to file
@@ -977,7 +575,7 @@ def exp_range_eps():
     for eps, rho in zip(eps_lst, rhos):
         method = "DPTR"
         print(f">>>>>\n Running {method} with rho={rho:.5f} (eps={eps:.2f})")
-        model, optimizer, results = tr_exp(alpha=eps_g_target, G=1, M=1, initial_gap=initial_gap, rho=rho, print_every=print_every, wandb_on=wandb_on)
+        model, optimizer, results = tr_exp(alpha=eps_g_target, G=1, M=1, initial_gap=initial_gap, rho=rho, print_every=print_every, seed=seed, wandb_on=wandb_on)
         print("")
         print("<<<<<")
         # write result to file
@@ -985,7 +583,13 @@ def exp_range_eps():
 
     output_file.close()
 
-exp_range_eps()
+eps_lst = np.arange(0.1, 0.2, 0.2)
+# eps_lst = np.array([0.1, 0.5, 1.0])
+rhos = dp2rdp(eps_lst, 1 / n)
+wandb_on = False
+SEED = 21
+
+# exp_range_eps(eps_lst, rhos, wandb_on=wandb_on, seed=SEED)
 # %%
-# rho = .1
-# model, optimizer, results = tr_exp(alpha=eps_g_target, G=1, M=1, initial_gap=initial_gap, rho=rho, print_every=print_every, wandb_on=wandb_on)
+rho = .1
+model, optimizer, results = tr_exp(alpha=eps_g_target, G=1, M=1, initial_gap=initial_gap, rho=rho, print_every=print_every, wandb_on=wandb_on)
