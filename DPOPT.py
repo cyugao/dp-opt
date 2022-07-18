@@ -1,6 +1,6 @@
 import torch
 import numpy as np
-import scipy
+import scipy.linalg
 from torch.distributions.laplace import Laplace
 
 

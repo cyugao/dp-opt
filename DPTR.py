@@ -35,10 +35,7 @@ class DPTR(torch.optim.Optimizer):
         self.tr_radius = opt_params["alpha"] / opt_params["M"]
         self.sigma_g = 2 * opt_params["G"] / opt_params["n"] * (self.T / rho) ** 0.5
         self.sigma_H = (
-            2
-            * opt_params["M"]
-            / opt_params["n"]
-            * (self.T * opt_params["n_dim"] / rho) ** 0.5
+            2 * opt_params["M"] / opt_params["n"] * (self.T * self.n_dim / rho) ** 0.5
         )
         self.i = 0
 
@@ -52,7 +49,6 @@ class DPTR(torch.optim.Optimizer):
         n_dim = group["n_dim"]
 
         param = self._params[0]
-        orig_loss = closure()
         noisy_grad = param.grad + grad_sensitivity * self.sigma_g * torch.randn(n_dim)
         noisy_hess = (
             hess_closure()
