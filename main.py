@@ -165,7 +165,7 @@ def opt_shrink_T(model, optimizer, rho, init_T, min_T, max_iter, print_every):
             # XX, yy = XX.to(device), yy.to(device)
 
             loss = one_step(model, optimizer, X, y)
-            noisy_loss = (loss + sigma_f_unscaled * torch.randn()).item()
+            noisy_loss = (loss + sigma_f_unscaled * torch.randn(1)).item()
 
             if i % print_every == 0:
                 print(f"Iteration {i}: {loss.item():>.5f}")
@@ -229,7 +229,7 @@ def opt_grow_T(
             loss = one_step(model, optimizer, X, y)
             if i % print_every == 0:
                 print(f"Iteration {i}: {loss.item():>.5f}")
-            noisy_loss = (loss + sigma_f_unscaled * torch.randn()).item()
+            noisy_loss = (loss + sigma_f_unscaled * torch.randn(1)).item()
 
             if optimizer.complete:
                 print("Optimization complete!")
@@ -357,7 +357,8 @@ def dpopt_exp(
         gap = full_loss_closure() - opt_params["lower_bound"]
         gap += sigma_f * opt_params["f_sensitivity"] * abs(rng.normal(1))
     init_T = dp_estimate_T(gap, line_search=line_search)
-    # print(f"Estimated T={init_T}")
+    print(gap)
+    print(f"Estimated T={init_T}")
     min_T = int(init_T**0.5)  # TODO: another heuristic
     # measure running time
     start = time.perf_counter()
@@ -390,7 +391,7 @@ def dpopt_exp(
     print(f"Running time: {runtime:.2f}s")
     grad_norm = model.w.grad.norm()
     print(
-        f"Final loss: {loss:.5f}, grad_norm: {grad_norm:.5f}, privacy budget left: {rho:.5f}"
+        f"Final loss: {loss:.5f}, grad_norm: {grad_norm:.5f}, privacy budget left: {rho_left:.5f}"
     )
     print(optimizer.grad_evals, optimizer.hess_evals)
     # store loss, grad_norm, runtime in dictionary
@@ -466,14 +467,15 @@ def tr_exp(
     runtime = end - start
     print(f"Running time: {runtime:.2f}s")
     grad_norm = model.w.grad.norm()
+    rho_left = rho * i / T
     print(
-        f"Final loss: {loss:.5f}, grad_norm: {grad_norm:.5f}, privacy budget left: {rho:.5f}"
+        f"Final loss: {loss:.5f}, grad_norm: {grad_norm:.5f}, privacy budget left: {rho_left:.5f}"
     )
     results = dict(
         loss=loss,
         grad_norm=grad_norm,
         runtime=runtime,
-        rho_left=rho * i / T,
+        rho_left=rho_left,
         num_iter=i,
     )
     wandb.run.summary.update(results)
@@ -539,14 +541,16 @@ def exp_range_eps(eps_lst, rhos=None, wandb_on=True, seed=21):
 
     output_file.close()
 
-eps_lst = np.arange(0.1, 0.2, 0.2)
+eps_lst = np.arange(0.1, 2, 0.2)
 # eps_lst = np.array([0.1, 0.5, 1.0])
 rhos = dp2rdp(eps_lst, 1 / n)
 wandb_on = False
 SEED = 21
 
 # exp_range_eps(eps_lst, rhos, wandb_on=wandb_on, seed=SEED)
-rho = 0.1
-strategy = "grow"
+rho = 1
+strategy = "adaptive"
+
+
 dpopt_exp(opt_params, strategy, initial_gap=initial_gap, rho=rho, line_search=True, max_iter=2000, print_every=print_every, seed=SEED, wandb_on=wandb_on)
-model, optimizer, results = tr_exp(alpha=eps_g_target, G=1, M=1, initial_gap=initial_gap, rho=rho, print_every=print_every, wandb_on=wandb_on)
+# model, optimizer, results = tr_exp(alpha=eps_g_target, G=1, M=1, initial_gap=initial_gap, rho=rho, print_every=print_every, wandb_on=wandb_on)
