@@ -17,22 +17,52 @@ WANDB_PROJECT = "dpopt"
 
 # %%
 
-df_covtype = pd.read_csv("data/covtype.csv")
-df_covtype.head()
 normalize_df = lambda df: (df - df.mean()) / df.std()
-# Standardize numerical columns
-df_covtype.iloc[:, :10] = normalize_df(df_covtype.iloc[:, :10])
 
 
-# only keep cover type 1 and 2 for binary classification
-df_covtype = df_covtype[df_covtype["Cover_Type"] <= 2]
+def load_covtype():
+    df = pd.read_csv("data/covtype.csv")
+    # Standardize numerical columns
+    df.iloc[:, :10] = normalize_df(df.iloc[:, :10])
 
-X, y = df_covtype.iloc[:, :-1].to_numpy(), df_covtype.iloc[:, -1].to_numpy()
-# Change labels to +1 and -1
-y[y == 2] = -1
-X = torch.Tensor(X)
-y = torch.Tensor(y)
+    # only keep cover type 1 and 2 for binary classification
+    df = df[df["Cover_Type"] <= 2]
 
+    X, y = df.iloc[:, :-1].to_numpy(), df.iloc[:, -1].to_numpy()
+    # Change labels to +1 and -1
+    y[y == 2] = -1
+    X = torch.Tensor(X)
+    y = torch.Tensor(y)
+    return X, y
+
+
+def load_ijcnn():
+    df = pd.read_csv("data/ijcnn.csv")
+    # Standardize numerical columns
+    df.iloc[:, 10:] = normalize_df(df.iloc[:, 10:])
+
+    X, y = df.iloc[:, :-1].to_numpy(), df.iloc[:, -1].to_numpy()
+    X = torch.Tensor(X)
+    y = torch.Tensor(y)
+    return X, y
+
+
+def load_mnist():
+    import torchvision as ptv
+
+    train_set = ptv.datasets.MNIST(
+        "./data/mnist/train",
+        train=True,
+        transform=ptv.transforms.ToTensor(),
+        download=True,
+    )
+    # test_set = ptv.datasets.MNIST(
+    #     "./data/mnist/test", train=False, transform=ptv.transforms.ToTensor(), download=True
+    # )
+    return train_set.data, train_set.targets
+
+
+X, y = load_ijcnn()
 n, n_dim = X.shape
 X.shape, y.shape
 
@@ -47,16 +77,24 @@ class ERM(torch.nn.Module):
         self.w = torch.nn.Parameter(torch.randn(self.input_dim))
 
     def forward(self, X, y, w=None):
-        """
-        In the forward function we accept a Tensor of input data and we must return
-        a Tensor of output data. We can use Modules defined in the constructor as
-        well as arbitrary operators on Tensors.
-        """
         if w is None:
             w = self.w
         return torch.log1p(
             torch.exp(-y * (X @ w))
         ).mean() + self.reg_coef * self.regularizer(w)
+
+
+# class ERM_Multi(torch.nn.Module):
+#     def __init__(self, input_dim, regularizer, n_class=10, reg_coef=1e-3):
+#         super(ERM_Multi, self).__init__()
+#         self.input_dim = input_dim
+#         self.regularizer = regularizer
+#         self.reg_coef = reg_coef
+
+#         self.dense = torch.nn.Linear(self.input_dim, n_class)
+
+#     def forward(self, X, y, w=None):
+#         + self.reg_coef * self.regularizer(w)
 
 
 # Get cpu or gpu device for training.
@@ -70,6 +108,15 @@ def regularizer(w):
 
 
 # %%
+def dp2rdp(eps, delta):
+    i = np.log(1 / delta)
+    return (np.sqrt(eps + i) - np.sqrt(i)) ** 2
+
+
+def rdp2dp(rho, delta):
+    # reverse
+    i = np.log(1 / delta)
+    return (rho**0.5 + np.sqrt(i)) ** 2 - i
 
 
 def check_and_compute_params(opt_params):
@@ -119,7 +166,7 @@ def check_and_compute_params(opt_params):
     opt_params["checked"] = True
 
 
-def dp_estimate_T(gap, line_search=True):
+def dp_estimate_T(opt_params, gap, line_search=True):
     assert opt_params["checked"]
     if line_search:
         decrease = opt_params["min_decrease_ls"]
@@ -137,12 +184,15 @@ def one_step(model, optimizer, X, y):
         lambda w: model(X, y, w), model.w
     )
     optimizer.step(lambda: model(X, y), hess_closure)
+    grad_norm = model.w.grad.norm()
     wandb.log({"loss": loss})
-    wandb.log({"grad_norm": model.w.grad.norm()})
+    wandb.log({"grad_norm": grad_norm})
     return loss
 
 
-def opt_shrink_T(model, optimizer, rho, init_T, min_T, max_iter, print_every):
+def opt_shrink_T(
+    model, optimizer, rho, init_T, min_T, max_iter, print_every, opt_params
+):
     i = 0  # global iteration counter
     T = init_T
     while not optimizer.complete and i < max_iter:
@@ -205,6 +255,7 @@ def opt_grow_T(
     min_T,
     max_iter,
     print_every,
+    opt_params,
     fallback_rho_frac=0.25,
 ):
     i = 0  # global iteration counter
@@ -251,7 +302,7 @@ def opt_grow_T(
     rho += fallback_rho
     if not optimizer.complete:
         rho_0 = rho / T
-        sigma_g = sigma_H = lambda_svt = (1 / (2 * rho_0 / 3)) ** 0.5
+        sigma_g = sigma_H = lambda_svt = (3 / (2 * rho_0)) ** 0.5
         # print(sigma_f_unscaled)
         optimizer.new_epoch(sigma_g, sigma_H, lambda_svt)
         for j in range(min(T, max_iter - i)):
@@ -270,6 +321,77 @@ def opt_grow_T(
     return loss, rho, i
 
 
+def opt_fixed_T(model, optimizer, rho, init_T, print_every):
+    T = init_T
+    rho_0 = rho / (T + 1)
+    sigma_f = sigma_g = sigma_H = lambda_svt = (1 / (2 * rho_0 / 4)) ** 0.5
+    optimizer.new_epoch(sigma_g, sigma_H, lambda_svt)
+    # Running main loop
+    print("Running main loop...")
+    for j in range(T):
+        # indices = rng.choice(n, size=batch_size)
+        # XX, yy = X[indices], y[indices]
+        # XX, yy = XX.to(device), yy.to(device)
+        loss = one_step(model, optimizer, X, y)
+        if j % print_every == 0:
+            print(f"Iteration {j}: {loss.item():>.5f}")
+
+        if optimizer.complete:
+            print("Optimization complete!")
+            rho *= 1 - (j + 1) / (T + 1)
+            break
+    return loss, rho, j
+
+
+def estimate_lower_bound(
+    model,
+    optimizer,
+    eps_total,
+    delta_total,
+    T,
+    rng,
+    print_every,
+    batch_size=2000,
+    trials=5,
+):
+    """
+    Estimate the lower bound of f using specified privacy budget.
+    Averaged over {trials} times"""
+    eps, delta = eps_total / trials, delta_total / trials
+    s = batch_size / n
+    # due to subsampling, eps' = s(e^eps - 1) ~= s*eps, delta' = s*delta
+    rho_0 = dp2rdp(eps / s, delta / s)
+    ic(s, rho_0, eps, delta)
+    # "/ s" for scaling of sensitivity
+    # sigma_g = sigma_H = lambda_svt = (3 / (2 * (rho_0 / T))) ** 0.5 / s
+    eps_0 = eps / (12 * (2 * T * np.log(2 / delta)) ** 0.5)  # omit because s/m = 1/n
+    delta_0 = delta / (4 * s * T)
+    sigma_g = sigma_H = (2 * np.log(1.25 / delta_0)) ** 0.5 / eps_0
+    lambda_svt = 1 / eps_0
+    ic(sigma_g, lambda_svt)
+    input()
+    optimizer.new_epoch(sigma_g, sigma_H, lambda_svt)
+
+    lower_bounds = np.zeros(trials)
+    rho_left = 0
+    for i in range(trials):
+        indices = rng.choice(n, size=batch_size)
+        XX, yy = X[indices], y[indices]
+        for j in range(T):
+            loss = one_step(model, optimizer, XX, yy)
+            if j % print_every == 0:
+                print(
+                    f"(Trial {i}) Iteration {j}: loss={loss.item():>.5f}, grad_norm={model.w.grad.norm().item():.5f}"
+                )
+            if optimizer.complete:
+                rho_left += rho_0 * (T - j - 1) / T
+                print(f"Trial {i} complete.")
+                optimizer.complete = False
+                break
+        lower_bounds[i] = loss
+    return lower_bounds, rho_left
+
+
 def opt_adapt_T(
     model,
     optimizer,
@@ -279,14 +401,47 @@ def opt_adapt_T(
     max_iter,
     print_every,
     estimate_T_closure,
+    rng,
     update_T_every=20,
 ):
-    i = 0  # global iteration counter
+    estimate = False
+    if estimate:
+        # estimate lower bound of f
+        delta = 1 / n
+        eps = rdp2dp(rho, delta)
+        eps1, delta1 = eps / 4, delta / 4
+        print("Estimating lower bound of f...")
+        lower_bounds, rho_left = estimate_lower_bound(
+            model,
+            optimizer,
+            eps1,
+            delta1,
+            init_T,
+            rng,
+            print_every,
+            batch_size=1000,
+            trials=10,
+        )
+        rho = rho * 3 / 4 + rho_left
+        lb_mean, lb_std = lower_bounds.mean(), lower_bounds.std()
+        print(f"Lower bound: {lb_mean:.5f}, standard deviation: {lb_std:.5f}\n")
+        opt_params["lower_bound"] = (
+            lb_mean - 2 * lb_std
+        )  # 95% confidence interval lower end
+        # TODO: estimate f^* using small dataset
+        # can estimate variance by doing this multiple times
+        rho = rdp2dp(eps - eps1, delta - delta1) + rho_left
+    # T = estimate_T_closure(sigma_f)
     T = init_T
+    i = 0  # global iteration counter
+    # Running main loop
+    print("Running main loop...")
     while not optimizer.complete and i < max_iter:
         rho_0 = rho / (T + 1)
         sigma_f = (1 / (2 * rho_0)) ** 0.5  # Budget for updating the estimate of T
-        sigma_g = sigma_H = lambda_svt = (1 / (2 * rho_0 / 3)) ** 0.5
+        sigma_g = sigma_H = lambda_svt = (3 / (2 * rho_0)) ** 0.5
+        # ic(sigma_g)
+        # input()
         optimizer.new_epoch(sigma_g, sigma_H, lambda_svt)
         steps = update_T_every if T > min_T else min_T
         for j in range(steps):
@@ -356,7 +511,7 @@ def dpopt_exp(
         sigma_f = (1 / (2 * rho_f)) ** 0.5
         gap = full_loss_closure() - opt_params["lower_bound"]
         gap += sigma_f * opt_params["f_sensitivity"] * abs(rng.normal(1))
-    init_T = dp_estimate_T(gap, line_search=line_search)
+    init_T = dp_estimate_T(opt_params, gap, line_search=line_search)
     print(gap)
     print(f"Estimated T={init_T}")
     min_T = int(init_T**0.5)  # TODO: another heuristic
@@ -367,7 +522,7 @@ def dpopt_exp(
         def estimate_T_closure(sigma_f):
             gap = full_loss_closure() - opt_params["lower_bound"]
             gap += sigma_f * opt_params["f_sensitivity"] * abs(rng.normal(1))
-            return dp_estimate_T(gap, line_search=line_search)
+            return dp_estimate_T(opt_params, gap, line_search=line_search)
 
         out = opt_adapt_T(
             model,
@@ -378,11 +533,18 @@ def dpopt_exp(
             max_iter,
             print_every,
             estimate_T_closure,
+            rng,
         )
     elif strategy == "shrink":
-        out = opt_shrink_T(model, optimizer, rho, init_T, min_T, max_iter, print_every)
+        out = opt_shrink_T(
+            model, optimizer, rho, init_T, min_T, max_iter, print_every, opt_params
+        )
     elif strategy == "grow":
-        out = opt_grow_T(model, optimizer, rho, init_T, min_T, max_iter, print_every)
+        out = opt_grow_T(
+            model, optimizer, rho, init_T, min_T, max_iter, print_every, opt_params
+        )
+    elif strategy == "fixed":
+        out = opt_fixed_T(model, optimizer, rho, init_T, print_every)
     else:
         raise ValueError(f"Unknown strategy: {strategy}")
     loss, rho_left, num_iter = out
@@ -500,34 +662,29 @@ opt_params = dict(
 check_and_compute_params(opt_params)
 print_every = 10
 initial_gap = 0.5
-def dp2rdp(eps, delta):
-    i = np.log(1/delta)
-    return (np.sqrt(eps + i) - np.sqrt(i)) ** 2
-
-def rdp2dp(rho, delta):
-    # reverse
-    i = np.log(1/delta)
-    return (rho ** 0.5 + np.sqrt(i)) ** 2 - i
 
 # rho2rdp_map = dict(zip(rhos, eps_lst))
 # print(f"eps={eps:.2f}, rho={rho:.5f}")
 
-def exp_range_eps(eps_lst, rhos=None, wandb_on=True, seed=21):
+def exp_range_eps(eps_lst, strategy_lst, rhos=None, wandb_on=True, seed=21):
     if rhos is None:
         rhos = dp2rdp(eps_lst, 1 / n)
     time_str = datetime.now().strftime("%m%d-%H%M%S")
     output_file = open(os.path.join("results", f"result-eps_g={eps_g:.4f}_{time_str}.csv"), 'w')
     output_file.write("method,eps,rho,complete,loss,grad_norm,runtime,rho_left,num_iter\n")
-
-    for eps, rho in zip(eps_lst, rhos):
-        for ls in [True, False]:
-            method = "DPOPT-LS" if ls else "DPOPT"
-            print(f">>>>>\n Running {method} with rho={rho:.5f} (eps={eps:.2f})")
-            model, optimizer, results = dpopt_exp(opt_params, initial_gap=initial_gap, rho=rho, line_search=ls, max_iter=2000, print_every=print_every, seed=seed, wandb_on=wandb_on)
-            print("")
-            print("<<<<<")
-            # write result to file
-            output_file.write(f"{method},{eps:.4f},{rho:.5f},{optimizer.complete},{results['loss']:.5f},{results['grad_norm']:.5f},{results['runtime']:.5f},{results['rho_left']:.5f},{results['num_iter']}\n")
+    for strategy in strategy_lst:
+        for eps, rho in zip(eps_lst, rhos):
+            for ls in [True, False]:
+                method = ("DPOPT-LS-" if ls else "DPOPT-") + strategy
+                print(f">>>>>\n Running {method} with rho={rho:.5f} (eps={eps:.2f})")
+                try:
+                    model, optimizer, results = dpopt_exp(opt_params, strategy, initial_gap=initial_gap, rho=rho, line_search=ls, max_iter=2000, print_every=print_every, seed=seed, wandb_on=wandb_on)
+                    print("")
+                    print("<<<<<")
+                    # write result to file
+                    output_file.write(f"{method},{eps:.4f},{rho:.5f},{optimizer.complete},{results['loss']:.5f},{results['grad_norm']:.5f},{results['runtime']:.5f},{results['rho_left']:.5f},{results['num_iter']}\n")
+                except Exception as e:
+                    print(f"method={method}, eps={eps:.4f}, rho={rho:.5f} failed:\n {str(e)}")
     # model, optimizer = tr_exp(alpha=eps_g, G=1, M=1, initial_gap=initial_gap, rho=rho, print_every=print_every, wandb_on=wandb_on)
     print("Running DPTR...")
     for eps, rho in zip(eps_lst, rhos):
@@ -541,16 +698,22 @@ def exp_range_eps(eps_lst, rhos=None, wandb_on=True, seed=21):
 
     output_file.close()
 
-eps_lst = np.arange(0.1, 2, 0.2)
+eps_lst = np.arange(0.1, 1.1, 0.2)
+# eps_lst = np.array([10])
 # eps_lst = np.array([0.1, 0.5, 1.0])
 rhos = dp2rdp(eps_lst, 1 / n)
 wandb_on = False
-SEED = 21
+SEED = 2022
 
 # exp_range_eps(eps_lst, rhos, wandb_on=wandb_on, seed=SEED)
-rho = 1
-strategy = "adaptive"
+strategies = ["grow", "shrink"]
+rho = rhos[0]
+strategy = "fixed"
+
+exp_range_eps(eps_lst, strategies, rhos, wandb_on=wandb_on, seed=SEED)
 
 
-dpopt_exp(opt_params, strategy, initial_gap=initial_gap, rho=rho, line_search=True, max_iter=2000, print_every=print_every, seed=SEED, wandb_on=wandb_on)
+# dpopt_exp(opt_params, strategy, initial_gap=initial_gap, rho=rho, line_search=True, max_iter=2000, print_every=print_every, seed=SEED, wandb_on=wandb_on)
 # model, optimizer, results = tr_exp(alpha=eps_g_target, G=1, M=1, initial_gap=initial_gap, rho=rho, print_every=print_every, wandb_on=wandb_on)
+
+# %%
