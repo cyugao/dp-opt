@@ -26,6 +26,8 @@ class DPOPT(torch.optim.Optimizer):
         self.rdp_accountant = 0
         self.mini_batch = use_mini_batch
         self.line_search = line_search
+        self.eps_g = opt_params["eps_g"]
+        self.eps_H = opt_params["eps_H"]
         self.gamma_g_init = opt_params["b_g"] * opt_params["gamma_g_bar"]
         self.qg_scalar = 2 / opt_params["n"] * self.gamma_g_init * opt_params["G"]
         self.gamma_H_init_scalar = (
@@ -60,8 +62,6 @@ class DPOPT(torch.optim.Optimizer):
         # Make sure the closure is always called with grad enabled
         closure = torch.enable_grad()(closure)
         group = self.param_groups[0]
-        eps_g = group["eps_g"]
-        eps_H = group["eps_H"]
         n_dim = group["n_dim"]
         c_g = group["c_g"]
         c_H = group["c_H"]
@@ -110,7 +110,7 @@ class DPOPT(torch.optim.Optimizer):
             param.copy_(w_init + gamma * direction)
             return float(closure())
 
-        if noisy_grad_norm > eps_g:
+        if noisy_grad_norm > self.eps_g:
             # Gradient step
             if not self.line_search:
                 param.add_(noisy_grad, alpha=-1 / G)
@@ -143,7 +143,7 @@ class DPOPT(torch.optim.Optimizer):
             i, v = self.smallest_eig(noisy_hess)
             self.hess_evals += 1
 
-            if i > -eps_H:
+            if i > -self.eps_H:
                 self.complete = True
                 return
 
@@ -236,3 +236,7 @@ class DPOPT(torch.optim.Optimizer):
         self.sigma_g = sigma_g
         self.sigma_H = sigma_H
         self.lambda_svt = lambda_svt
+    
+    def set_sosp_params(self, eps_g, eps_H):
+        self.eps_g = eps_g
+        self.eps_H = eps_H

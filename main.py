@@ -62,7 +62,7 @@ def load_mnist():
     return train_set.data, train_set.targets
 
 
-X, y = load_ijcnn()
+X, y = load_covtype()
 n, n_dim = X.shape
 X.shape, y.shape
 
@@ -343,6 +343,72 @@ def opt_fixed_T(model, optimizer, rho, init_T, print_every):
     return loss, rho, j
 
 
+# %%
+from autodp.mechanism_zoo import ExactGaussianMechanism, PureDP_Mechanism
+from autodp.transformer_zoo import Composition, AmplificationBySampling
+
+subsample = AmplificationBySampling(PoissonSampling=False)
+
+
+def create_complex_mech(
+    rho, T, subsample_prob, num_num_trials, improved_bound_flag=True
+):
+    effective_sigma = (1 / (2 * 2 / 3 * rho)) ** 0.5
+    eps = (2 / 3 * rho / T) ** 0.5
+    gm = ExactGaussianMechanism(effective_sigma, name="GM")
+    svt = PureDP_Mechanism(eps=eps, name="SVT")
+    gm.replace_one = True
+    svt.replace_one = True
+
+    compose = Composition()
+    mech = compose([gm, svt], [1, T])
+    mech.neighboring = "replace_one"
+    trial = subsample(mech, subsample_prob, improved_bound_flag=improved_bound_flag)
+    return compose([trial], [num_num_trials])
+
+
+# next we can create it as a mechanism class, which requires us to inherit the base mechanism class,
+#  which we import now
+from autodp.autodp_core import Mechanism
+from autodp.calibrator_zoo import generalized_eps_delta_calibrator
+
+
+class Complex_Mechanism(Mechanism):
+    def __init__(self, params, name="A_Good_Name"):
+        self.name = name
+        self.params = params
+        mech = create_complex_mech(
+            params["rho"],
+            params["T"],
+            params["subsample_prob"],
+            params["num_trials"],
+        )
+        # The following will set the function representation of the complex mechanism
+        # to be the same as that of the mech
+        self.set_all_representation(mech)
+
+
+general_calibrate = generalized_eps_delta_calibrator()
+
+
+def calibrate_rho(eps_budget, delta, T, subsample_prob, num_trials):
+    params = {
+        "rho": None,
+        "T": T,
+        "subsample_prob": subsample_prob,
+        "num_trials": num_trials,
+    }
+    return general_calibrate(
+        Complex_Mechanism,
+        eps_budget,
+        delta,
+        [1e-7, 1],
+        params=params,
+        para_name="rho",
+        name="Complex_Mechanism",
+    )
+
+
 def estimate_lower_bound(
     model,
     optimizer,
@@ -352,29 +418,28 @@ def estimate_lower_bound(
     rng,
     print_every,
     batch_size=2000,
-    trials=5,
+    num_trials=5,
 ):
     """
     Estimate the lower bound of f using specified privacy budget.
-    Averaged over {trials} times"""
-    eps, delta = eps_total / trials, delta_total / trials
-    s = batch_size / n
-    # due to subsampling, eps' = s(e^eps - 1) ~= s*eps, delta' = s*delta
-    rho_0 = dp2rdp(eps / s, delta / s)
-    ic(s, rho_0, eps, delta)
-    # "/ s" for scaling of sensitivity
-    # sigma_g = sigma_H = lambda_svt = (3 / (2 * (rho_0 / T))) ** 0.5 / s
-    eps_0 = eps / (12 * (2 * T * np.log(2 / delta)) ** 0.5)  # omit because s/m = 1/n
-    delta_0 = delta / (4 * s * T)
-    sigma_g = sigma_H = (2 * np.log(1.25 / delta_0)) ** 0.5 / eps_0
-    lambda_svt = 1 / eps_0
-    ic(sigma_g, lambda_svt)
-    input()
+    Averaged over {num_trials} times"""
+    eps, delta = eps_total / num_trials, delta_total / num_trials
+    subsample_prob = batch_size / n
+    ic(eps, delta, T, subsample_prob)
+    start = time.perf_counter()
+    mech = calibrate_rho(eps, delta, T, subsample_prob, num_trials)
+    end = time.perf_counter()
+    runtime = end - start
+    print(f"Running time (lower bound estimation): {runtime:.2f}s")
+    rho = mech.params["rho"]
+    sigma_g = sigma_H = lambda_svt = (3 / (2 * (rho / T))) ** 0.5
+    ic(sigma_g, sigma_H)
+    # input()
     optimizer.new_epoch(sigma_g, sigma_H, lambda_svt)
 
-    lower_bounds = np.zeros(trials)
+    lower_bounds = np.zeros(num_trials)
     rho_left = 0
-    for i in range(trials):
+    for i in range(num_trials):
         indices = rng.choice(n, size=batch_size)
         XX, yy = X[indices], y[indices]
         for j in range(T):
@@ -384,7 +449,7 @@ def estimate_lower_bound(
                     f"(Trial {i}) Iteration {j}: loss={loss.item():>.5f}, grad_norm={model.w.grad.norm().item():.5f}"
                 )
             if optimizer.complete:
-                rho_left += rho_0 * (T - j - 1) / T
+                # rho_left += rho_0 * (T - j - 1) / T
                 print(f"Trial {i} complete.")
                 optimizer.complete = False
                 break
@@ -402,15 +467,18 @@ def opt_adapt_T(
     print_every,
     estimate_T_closure,
     rng,
-    update_T_every=20,
+    update_T_every=100,
 ):
-    estimate = False
+    estimate = True
     if estimate:
         # estimate lower bound of f
         delta = 1 / n
         eps = rdp2dp(rho, delta)
         eps1, delta1 = eps / 4, delta / 4
         print("Estimating lower bound of f...")
+        eps_g, eps_H = optimizer.eps_g, optimizer.eps_H
+
+        optimizer.set_sosp_params(eps_g * 10, eps_H * 3)
         lower_bounds, rho_left = estimate_lower_bound(
             model,
             optimizer,
@@ -420,13 +488,16 @@ def opt_adapt_T(
             rng,
             print_every,
             batch_size=1000,
-            trials=10,
+            num_trials=5,
         )
+        optimizer.set_sosp_params(eps_g, eps_H)
         rho = rho * 3 / 4 + rho_left
         lb_mean, lb_std = lower_bounds.mean(), lower_bounds.std()
-        print(f"Lower bound: {lb_mean:.5f}, standard deviation: {lb_std:.5f}\n")
+        print(
+            f"Estimated lower bound: {lb_mean:.5f}, standard deviation: {lb_std:.5f}\n"
+        )
         opt_params["lower_bound"] = (
-            lb_mean - 2 * lb_std
+            lb_mean - 2 * 1.414 * lb_std
         )  # 95% confidence interval lower end
         # TODO: estimate f^* using small dataset
         # can estimate variance by doing this multiple times
@@ -698,22 +769,23 @@ def exp_range_eps(eps_lst, strategy_lst, rhos=None, wandb_on=True, seed=21):
 
     output_file.close()
 
-eps_lst = np.arange(0.1, 1.1, 0.2)
+eps_lst = np.arange(1, 1.1, 0.2)
 # eps_lst = np.array([10])
 # eps_lst = np.array([0.1, 0.5, 1.0])
-rhos = dp2rdp(eps_lst, 1 / n)
+delta = 1 / 10000
+rhos = dp2rdp(eps_lst, delta)
 wandb_on = False
 SEED = 2022
 
 # exp_range_eps(eps_lst, rhos, wandb_on=wandb_on, seed=SEED)
 strategies = ["grow", "shrink"]
 rho = rhos[0]
-strategy = "fixed"
 
-exp_range_eps(eps_lst, strategies, rhos, wandb_on=wandb_on, seed=SEED)
+# exp_range_eps(eps_lst, strategies, rhos, wandb_on=wandb_on, seed=SEED)
 
 
-# dpopt_exp(opt_params, strategy, initial_gap=initial_gap, rho=rho, line_search=True, max_iter=2000, print_every=print_every, seed=SEED, wandb_on=wandb_on)
+strategy = "adaptive"
+dpopt_exp(opt_params, strategy, initial_gap=initial_gap, rho=rho, line_search=True, max_iter=2000, print_every=print_every, seed=SEED, wandb_on=wandb_on)
 # model, optimizer, results = tr_exp(alpha=eps_g_target, G=1, M=1, initial_gap=initial_gap, rho=rho, print_every=print_every, wandb_on=wandb_on)
 
 # %%
