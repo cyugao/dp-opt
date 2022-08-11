@@ -3,6 +3,9 @@ import numpy as np
 import scipy.linalg
 from torch.distributions.laplace import Laplace
 
+GRADIENT_STEP = 0
+CURVATURE_STEP = 1
+FINISHED_STEP = -1
 
 class DPOPT(torch.optim.Optimizer):
 
@@ -45,6 +48,8 @@ class DPOPT(torch.optim.Optimizer):
         self.rdp_mech = None
         self.grad_evals = 0
         self.hess_evals = 0
+        self.grad_evals_total = 0
+        self.hess_evals_total = 0
 
     @torch.no_grad()
     def step(self, closure, hess_closure):
@@ -114,7 +119,7 @@ class DPOPT(torch.optim.Optimizer):
             # Gradient step
             if not self.line_search:
                 param.add_(noisy_grad, alpha=-1 / G)
-                return
+                return GRADIENT_STEP, noisy_grad_norm
             # Backtracking line search
             qg_sensitivity = self.qg_scalar * noisy_grad_norm
 
@@ -134,6 +139,7 @@ class DPOPT(torch.optim.Optimizer):
             )
             # ic(gamma)
             param.copy_(w_init - gamma * noisy_grad)
+            return GRADIENT_STEP, noisy_grad_norm
         else:
             print("curvature step")
             noisy_hess = (
@@ -145,12 +151,12 @@ class DPOPT(torch.optim.Optimizer):
 
             if i > -self.eps_H:
                 self.complete = True
-                return
+                return FINISHED_STEP, None
 
             # Negative curvature step
             if not self.line_search:
                 param.add_(v, alpha=2 * -i / M)
-                return
+                return CURVATURE_STEP, i
 
             # Backtracking line search
             gamma_H_init = self.gamma_H_init_scalar * -i
@@ -171,7 +177,7 @@ class DPOPT(torch.optim.Optimizer):
                 self.lambda_svt,
             )
             param.copy_(w_init + gamma * v)
-
+            return CURVATURE_STEP, i
         # accumulate RDP
         # self.mech = compose(mechanism_list, coeff_list, RDP_compose_only=True)
 
@@ -231,8 +237,10 @@ class DPOPT(torch.optim.Optimizer):
     #     return compose([gm_grad, gm_hess], [self.grad_evals, self.hess_evals])
 
     def new_epoch(self, sigma_g, sigma_H, lambda_svt):
-        # self.grad_evals = 0
-        # self.hess_evals = 0
+        self.grad_evals_total += self.grad_evals
+        self.hess_evals_total += self.hess_evals
+        self.grad_evals = 0
+        self.hess_evals = 0
         self.sigma_g = sigma_g
         self.sigma_H = sigma_H
         self.lambda_svt = lambda_svt

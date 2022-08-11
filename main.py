@@ -10,6 +10,7 @@ import torch
 
 from DPTR import DPTR
 from DPOPT import DPOPT
+from DPOPT import GRADIENT_STEP, CURVATURE_STEP
 
 import wandb
 
@@ -63,6 +64,7 @@ def load_mnist():
 
 
 X, y = load_covtype()
+print("Dataset size:", X.shape)
 n, n_dim = X.shape
 X.shape, y.shape
 
@@ -189,6 +191,18 @@ def one_step(model, optimizer, X, y):
     wandb.log({"grad_norm": grad_norm})
     return loss
 
+def one_step_extra(model, optimizer, X, y):
+    loss = model(X, y)
+    optimizer.zero_grad()
+    loss.backward()
+    hess_closure = lambda: torch.autograd.functional.hessian(
+        lambda w: model(X, y, w), model.w
+    )
+    STEP, noisy_value = optimizer.step(lambda: model(X, y), hess_closure)
+    grad_norm = model.w.grad.norm()
+    wandb.log({"loss": loss})
+    wandb.log({"grad_norm": grad_norm})
+    return loss, (STEP, noisy_value)
 
 def opt_shrink_T(
     model, optimizer, rho, init_T, min_T, max_iter, print_every, opt_params
@@ -267,8 +281,8 @@ def opt_grow_T(
             T = init_T
             break
         prev_noisy_loss = None
-        rho_0 = rho / T
-        sigma_f = sigma_g = sigma_H = lambda_svt = (1 / (2 * rho_0 / 4)) ** 0.5
+        rho_0 = rho / T / 4
+        sigma_f = sigma_g = sigma_H = lambda_svt = (1 / (2 * rho_0)) ** 0.5
         sigma_f_unscaled = sigma_f * opt_params["f_sensitivity"]
         # print(sigma_f_unscaled)
         optimizer.new_epoch(sigma_g, sigma_H, lambda_svt)
@@ -301,6 +315,7 @@ def opt_grow_T(
 
     rho += fallback_rho
     if not optimizer.complete:
+        print("Entering fallback")
         rho_0 = rho / T
         sigma_g = sigma_H = lambda_svt = (3 / (2 * rho_0)) ** 0.5
         # print(sigma_f_unscaled)
@@ -324,7 +339,7 @@ def opt_grow_T(
 def opt_fixed_T(model, optimizer, rho, init_T, print_every):
     T = init_T
     rho_0 = rho / (T + 1)
-    sigma_f = sigma_g = sigma_H = lambda_svt = (1 / (2 * rho_0 / 4)) ** 0.5
+    sigma_g = sigma_H = lambda_svt = (1 / (2 * rho_0 / 3)) ** 0.5
     optimizer.new_epoch(sigma_g, sigma_H, lambda_svt)
     # Running main loop
     print("Running main loop...")
@@ -433,6 +448,7 @@ def estimate_lower_bound(
     print(f"Running time (lower bound estimation): {runtime:.2f}s")
     rho = mech.params["rho"]
     sigma_g = sigma_H = lambda_svt = (3 / (2 * (rho / T))) ** 0.5
+    # sigma_H = (1.5 / (2 * (rho / T))) ** 0.5
     ic(sigma_g, sigma_H)
     # input()
     optimizer.new_epoch(sigma_g, sigma_H, lambda_svt)
@@ -469,7 +485,7 @@ def opt_adapt_T(
     rng,
     update_T_every=100,
 ):
-    estimate = True
+    estimate = False
     if estimate:
         # estimate lower bound of f
         delta = 1 / n
@@ -478,7 +494,7 @@ def opt_adapt_T(
         print("Estimating lower bound of f...")
         eps_g, eps_H = optimizer.eps_g, optimizer.eps_H
 
-        optimizer.set_sosp_params(eps_g * 10, eps_H * 3)
+        optimizer.set_sosp_params(eps_g * 10, eps_H * 10)
         lower_bounds, rho_left = estimate_lower_bound(
             model,
             optimizer,
@@ -498,9 +514,7 @@ def opt_adapt_T(
         )
         opt_params["lower_bound"] = (
             lb_mean - 2 * 1.414 * lb_std
-        )  # 95% confidence interval lower end
-        # TODO: estimate f^* using small dataset
-        # can estimate variance by doing this multiple times
+        )  # 95% confidence interval lower end        # can estimate variance by doing this multiple times
         rho = rdp2dp(eps - eps1, delta - delta1) + rho_left
     # T = estimate_T_closure(sigma_f)
     T = init_T
@@ -541,6 +555,69 @@ def opt_adapt_T(
 
     return loss, rho, i
 
+def opt_adapt_noise(
+    model,
+    optimizer,
+    rho,
+    init_T,
+    min_T,
+    max_iter,
+    print_every,
+):
+    T = init_T
+    i = 0
+    last_epoch = False
+    while not optimizer.complete and i < max_iter and T > 0:
+        rho_0 = rho / T / 3
+        sigma_g = sigma_H = lambda_svt = (1 / (2 * rho_0)) ** 0.5
+        # ic(sigma_g)
+        # input()
+        optimizer.new_epoch(sigma_g, sigma_H, lambda_svt)
+        noise_g = 2 ** 0.5 * 5 * sigma_g * opt_params["grad_sensitivity"]
+        noise_H = 15 * sigma_H * opt_params["hess_sensitivity"]
+        for j in range(T):
+            i += 1
+            # indices = rng.choice(n, size=batch_size)
+            # XX, yy = X[indices], y[indices]
+            # XX, yy = XX.to(device), yy.to(device)
+            loss, (STEP, noisy_value) = one_step_extra(model, optimizer, X, y)
+            if i % print_every == 0:
+                print(f"Iteration {i}: {loss.item():>.5f}")
+
+            if optimizer.complete:
+                print("Optimization complete!")
+                break
+            
+            if last_epoch or j > T / 2:
+                continue
+
+            if STEP == GRADIENT_STEP:
+                if abs(noisy_value) < noise_g:
+                    print(f"Gradient step: {abs(noisy_value):.5f} < {noise_g:.5f}")
+                    break
+            elif STEP == CURVATURE_STEP:
+                if abs(noisy_value) < noise_H:
+                    print(f"Curvature step: {abs(noisy_value):.5f} < {noise_H:.5f}")
+                    break
+        rho_prev = rho
+        rho -= (j+1) * rho_0 * (1 + int(optimizer.line_search)) + optimizer.hess_evals * rho_0
+        print(f"Privacy budget change: rho={rho_prev:.5f} -> {rho:.5f}")
+        # if rho_prev < rho / 2:
+        #     T = rho // rho_0 # run with remaining budget
+        #     last_epoch = True
+        # elif T / 2 > min_T:
+        #     T //= 2
+        #     print("Decrease noise, T:", T)
+        # else:
+        #     last_epoch = True
+        if rho >= rho_prev / 2 and T / 2 > min_T:
+            T //= 2
+            print("Decrease noise, T:", T)
+        else:
+            T = int(rho // (3*rho_0)) # run with remaining budget
+            last_epoch = True
+
+    return loss, rho, i
 
 def dpopt_exp(
     opt_params,
@@ -583,9 +660,9 @@ def dpopt_exp(
         gap = full_loss_closure() - opt_params["lower_bound"]
         gap += sigma_f * opt_params["f_sensitivity"] * abs(rng.normal(1))
     init_T = dp_estimate_T(opt_params, gap, line_search=line_search)
-    print(gap)
-    print(f"Estimated T={init_T}")
-    min_T = int(init_T**0.5)  # TODO: another heuristic
+    print(f"gap={gap:.4f}, estimated T={init_T}")
+    # min_T = int(init_T**0.5)  # TODO: another heuristic
+    min_T = 20
     # measure running time
     start = time.perf_counter()
     if strategy == "adaptive":
@@ -605,6 +682,10 @@ def dpopt_exp(
             print_every,
             estimate_T_closure,
             rng,
+        )
+    elif strategy == "adapt_noise":
+        out = opt_adapt_noise(
+            model, optimizer, rho, init_T, min_T, max_iter, print_every
         )
     elif strategy == "shrink":
         out = opt_shrink_T(
@@ -626,7 +707,8 @@ def dpopt_exp(
     print(
         f"Final loss: {loss:.5f}, grad_norm: {grad_norm:.5f}, privacy budget left: {rho_left:.5f}"
     )
-    print(optimizer.grad_evals, optimizer.hess_evals)
+    # number of grad and hess evals
+    print(f"Number of grad, hess evals: {optimizer.grad_evals_total}, {optimizer.hess_evals_total}")
     # store loss, grad_norm, runtime in dictionary
     results = dict(
         loss=loss,
@@ -634,6 +716,8 @@ def dpopt_exp(
         runtime=runtime,
         rho_left=rho_left,
         num_iter=num_iter,
+        grad_evals=optimizer.grad_evals_total,
+        hess_evals=optimizer.hess_evals_total,
     )
     wandb.run.summary.update(results)
     wandb.finish()
@@ -719,7 +803,7 @@ def tr_exp(
 # Note that the DPOPT algorithm outputs a ((1+c1)eps_g, (1+c)eps_H)-approximate second-order necessary point.
 c1, c = 0.3, 1 / 12
 # eps_g, eps_H = 0.1 / (1 + c1), 0.316 / (1 + c)
-eps_g_target = 0.01
+eps_g_target = 0.05
 eps_g, eps_H = eps_g_target / (1 + c1), eps_g_target**0.5 / (1 + c)
 # eps_g, eps_H = 0.0001, 0.01
 loss_sensitivity, G, M = 1, 1, 1
@@ -769,7 +853,8 @@ def exp_range_eps(eps_lst, strategy_lst, rhos=None, wandb_on=True, seed=21):
 
     output_file.close()
 
-eps_lst = np.arange(1, 1.1, 0.2)
+# eps_lst = np.arange(1, 1.1, 0.2)
+eps_lst = np.arange(0.5, 1.1, 0.2)
 # eps_lst = np.array([10])
 # eps_lst = np.array([0.1, 0.5, 1.0])
 delta = 1 / 10000
@@ -778,13 +863,14 @@ wandb_on = False
 SEED = 2022
 
 # exp_range_eps(eps_lst, rhos, wandb_on=wandb_on, seed=SEED)
-strategies = ["grow", "shrink"]
+strategies = ["grow", "shrink", "adapt_noise", "adaptive", "fixed"]
 rho = rhos[0]
 
 # exp_range_eps(eps_lst, strategies, rhos, wandb_on=wandb_on, seed=SEED)
 
 
-strategy = "adaptive"
+# strategy = "adaptive"
+strategy = "grow"
 dpopt_exp(opt_params, strategy, initial_gap=initial_gap, rho=rho, line_search=True, max_iter=2000, print_every=print_every, seed=SEED, wandb_on=wandb_on)
 # model, optimizer, results = tr_exp(alpha=eps_g_target, G=1, M=1, initial_gap=initial_gap, rho=rho, print_every=print_every, wandb_on=wandb_on)
 
