@@ -3,6 +3,10 @@ import numpy as np
 import scipy.linalg
 from torch.distributions.laplace import Laplace
 
+GRADIENT_STEP = 0
+CURVATURE_STEP = 1
+FINISHED_STEP = -1
+
 
 class DPOPT(torch.optim.Optimizer):
 
@@ -26,23 +30,21 @@ class DPOPT(torch.optim.Optimizer):
         self.rdp_accountant = 0
         self.mini_batch = use_mini_batch
         self.line_search = line_search
+        self.eps_g = opt_params["eps_g"]
+        self.eps_H = opt_params["eps_H"]
         self.gamma_g_init = opt_params["b_g"] * opt_params["gamma_g_bar"]
         self.qg_scalar = 2 / opt_params["n"] * self.gamma_g_init * opt_params["G"]
         self.gamma_H_init_scalar = (
             opt_params["b_H"] * opt_params["t2"] / opt_params["M"]
         )
-        self.qH_scalar = (
-            opt_params["b_H"]
-            * 2
-            / opt_params["n"]
-            * self.gamma_g_init
-            * opt_params["G"]
-        )
+        self.qH_scalar = 2 / opt_params["n"] * opt_params["G"]
 
         # keep track of the RDP
         self.rdp_mech = None
         self.grad_evals = 0
         self.hess_evals = 0
+        self.grad_evals_total = 0
+        self.hess_evals_total = 0
 
     @torch.no_grad()
     def step(self, closure, hess_closure):
@@ -60,8 +62,6 @@ class DPOPT(torch.optim.Optimizer):
         # Make sure the closure is always called with grad enabled
         closure = torch.enable_grad()(closure)
         group = self.param_groups[0]
-        eps_g = group["eps_g"]
-        eps_H = group["eps_H"]
         n_dim = group["n_dim"]
         c_g = group["c_g"]
         c_H = group["c_H"]
@@ -76,6 +76,7 @@ class DPOPT(torch.optim.Optimizer):
         M = group["M"]
         grad_sensitivity = group["grad_sensitivity"]
         hess_sensitivity = group["hess_sensitivity"]
+        b_H = group["b_H"]
 
         # NOTE: LBFGS has only global state, but we register it as state for
         # the first param, because this helps with casting in load_state_dict
@@ -110,11 +111,11 @@ class DPOPT(torch.optim.Optimizer):
             param.copy_(w_init + gamma * direction)
             return float(closure())
 
-        if noisy_grad_norm > eps_g:
+        if noisy_grad_norm > self.eps_g:
             # Gradient step
             if not self.line_search:
                 param.add_(noisy_grad, alpha=-1 / G)
-                return
+                return GRADIENT_STEP, noisy_grad_norm
             # Backtracking line search
             qg_sensitivity = self.qg_scalar * noisy_grad_norm
 
@@ -134,44 +135,49 @@ class DPOPT(torch.optim.Optimizer):
             )
             # ic(gamma)
             param.copy_(w_init - gamma * noisy_grad)
+            return GRADIENT_STEP, noisy_grad_norm
         else:
             print("curvature step")
             noisy_hess = (
                 hess_closure()
                 + hess_sensitivity * self.sigma_H * self.random_symmetric_matrix(n_dim)
             )
-            i, v = self.smallest_eig(noisy_hess)
+            lam, v = self.smallest_eig(noisy_hess)
+            lam_abs = abs(lam)
+            if torch.dot(v, noisy_grad) > 0:
+                v = -v
             self.hess_evals += 1
 
-            if i > -eps_H:
+            if lam > -self.eps_H:
                 self.complete = True
-                return
+                return FINISHED_STEP, None
 
             # Negative curvature step
             if not self.line_search:
-                param.add_(v, alpha=2 * -i / M)
-                return
+                param.add_(v, alpha=2 * lam_abs / M)
+                return CURVATURE_STEP, lam
 
             # Backtracking line search
-            gamma_H_init = self.gamma_H_init_scalar * -i
+            gamma_H_init = self.gamma_H_init_scalar * lam_abs
+            gamma_H_bar = gamma_H_init / b_H
 
             closure_qH = (
                 lambda gamma: loss
                 - step_closure(closure, v, gamma)
-                - 0.5 * c_H * gamma * gamma * -i
+                - 0.5 * c_H * gamma * gamma * lam_abs
             )
-            qH_sensitivity = self.qH_scalar * -i
-
+            qH_sensitivity = self.qH_scalar * gamma_H_init
+            # ic(gamma_H_bar, gamma_H_init, qH_sensitivity)
             gamma = self.svt_line_search(
                 closure_qH,
                 qH_sensitivity,
                 beta_H,
                 gamma_H_init,
-                gamma_g_bar,
+                gamma_H_bar,
                 self.lambda_svt,
             )
             param.copy_(w_init + gamma * v)
-
+            return CURVATURE_STEP, lam
         # accumulate RDP
         # self.mech = compose(mechanism_list, coeff_list, RDP_compose_only=True)
 
@@ -231,8 +237,14 @@ class DPOPT(torch.optim.Optimizer):
     #     return compose([gm_grad, gm_hess], [self.grad_evals, self.hess_evals])
 
     def new_epoch(self, sigma_g, sigma_H, lambda_svt):
-        # self.grad_evals = 0
-        # self.hess_evals = 0
+        self.grad_evals_total += self.grad_evals
+        self.hess_evals_total += self.hess_evals
+        self.grad_evals = 0
+        self.hess_evals = 0
         self.sigma_g = sigma_g
         self.sigma_H = sigma_H
         self.lambda_svt = lambda_svt
+
+    def set_sosp_params(self, eps_g, eps_H):
+        self.eps_g = eps_g
+        self.eps_H = eps_H
