@@ -327,7 +327,7 @@ def opt_grow_T(
 
 def opt_fixed_T(model, optimizer, rho, init_T, print_every):
     T = init_T
-    rho_0 = rho / (T + 1)
+    rho_0 = rho / T
     sigma_g = sigma_H = lambda_svt = (1 / (2 * rho_0 / 3)) ** 0.5
     optimizer.new_epoch(sigma_g, sigma_H, lambda_svt)
     # Running main loop
@@ -342,8 +342,8 @@ def opt_fixed_T(model, optimizer, rho, init_T, print_every):
 
         if optimizer.complete:
             print("Optimization complete!")
-            rho *= 1 - (j + 1) / (T + 1)
             break
+    rho *= 1 - (j + 1) / T
     return loss, rho, j
 
 
@@ -355,8 +355,8 @@ subsample = AmplificationBySampling(PoissonSampling=False)
 
 
 def create_complex_mech(rho, T, subsample_prob, num_trials, improved_bound_flag=True):
-    effective_sigma = (1 / (2 * 2 / 3 * rho)) ** 0.5
-    eps = (2 / 3 * rho / T) ** 0.5
+    effective_sigma = (3 / (4 * rho)) ** 0.5
+    eps = (2 * rho / (3 * T)) ** 0.5
     gm = ExactGaussianMechanism(effective_sigma, name="GM")
     svt = PureDP_Mechanism(eps=eps, name="SVT")
     gm.replace_one = True
@@ -541,7 +541,7 @@ def opt_adapt_T(
         else:
             if T == min_T:
                 print(
-                    "This should not happen since optimzation should be completed by now!"
+                    "With high probability, this should not happen since optimzation should be completed by now!"
                 )
             last_T = T
             T = estimate_T_closure(sigma_f)
