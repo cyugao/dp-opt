@@ -23,7 +23,7 @@ class DPTR(torch.optim.Optimizer):
             )
 
         self._params = self.param_groups[0]["params"]
-        self.complete = False
+        self.completed = False
         self.rdp_accountant = 0
         self.mini_batch = use_mini_batch
         self.T = opt_params["T"]
@@ -60,7 +60,7 @@ class DPTR(torch.optim.Optimizer):
         # print(f"dual: {dual:.5f}")
         param.add_(torch.from_numpy(update))
         if dual < (self.alpha * self.M) ** 0.5:
-            self.complete = True
+            self.completed = True
 
     def solve_qcqp(self, H, g, r):
         # if positive definite, check the easy case
