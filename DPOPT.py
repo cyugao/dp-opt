@@ -26,7 +26,7 @@ class DPOPT(torch.optim.Optimizer):
             )
 
         self._params = self.param_groups[0]["params"]
-        self.complete = False
+        self.completed = False
         self.rdp_accountant = 0
         self.mini_batch = use_mini_batch
         self.line_search = line_search
@@ -149,7 +149,7 @@ class DPOPT(torch.optim.Optimizer):
             self.hess_evals += 1
 
             if lam > -self.eps_H:
-                self.complete = True
+                self.completed = True
                 return FINISHED_STEP, None
 
             # Negative curvature step
@@ -236,11 +236,16 @@ class DPOPT(torch.optim.Optimizer):
 
     #     return compose([gm_grad, gm_hess], [self.grad_evals, self.hess_evals])
 
+    def new_epoch_rho(self, rho_0):
+        if self.line_search:
+            self.sigma_g = self.sigma_H = self.lambda_svt = (3 / (2 * rho_0)) ** 0.5
+        else:
+            self.sigma_g = self.sigma_H = (1 / rho_0) ** 0.5
+            self.lambda_svt = None
+        return self.sigma_g
+            
+
     def new_epoch(self, sigma_g, sigma_H, lambda_svt):
-        self.grad_evals_total += self.grad_evals
-        self.hess_evals_total += self.hess_evals
-        self.grad_evals = 0
-        self.hess_evals = 0
         self.sigma_g = sigma_g
         self.sigma_H = sigma_H
         self.lambda_svt = lambda_svt
