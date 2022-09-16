@@ -40,7 +40,7 @@ class DPTR(torch.optim.Optimizer):
         self.i = 0
 
     @torch.no_grad()
-    def step(self, closure, hess_closure):
+    def step(self, closure, hess_closure, test_sosp=True):
         self.i += 1
         closure = torch.enable_grad()(closure)
         group = self.param_groups[0]
@@ -54,7 +54,12 @@ class DPTR(torch.optim.Optimizer):
             hess_closure()
             + hess_sensitivity * self.sigma_H * self.random_symmetric_matrix(n_dim)
         )
-
+        if test_sosp and noisy_grad.norm() < self.alpha:
+            lam, v = self.smallest_eig(noisy_hess)
+            if lam > -((self.alpha * self.M) ** 0.5):
+                self.completed = True
+                return
+            
         # update, dual = self.solve_qcqp(noisy_hess, noisy_grad, noisy_grad.norm())
         update, dual = self.solve_qcqp(noisy_hess, noisy_grad, self.tr_radius)
         # print(f"dual: {dual:.5f}")
