@@ -1,3 +1,4 @@
+from audioop import lin2adpcm
 from datetime import datetime
 import os
 import subprocess
@@ -368,7 +369,7 @@ from autodp.transformer_zoo import Composition, AmplificationBySampling
 subsample = AmplificationBySampling(PoissonSampling=False)
 
 
-def create_complex_mech(rho, T, subsample_prob, num_trials, improved_bound_flag=True):
+def create_complex_mech(rho, T, subsample_prob, num_trials, line_search, improved_bound_flag=True):
     effective_sigma = (3 / (4 * rho)) ** 0.5
     eps = (2 * rho / (3 * T)) ** 0.5
     gm = ExactGaussianMechanism(effective_sigma, name="GM")
@@ -377,7 +378,10 @@ def create_complex_mech(rho, T, subsample_prob, num_trials, improved_bound_flag=
     svt.replace_one = True
 
     compose = Composition()
-    mech = compose([gm, svt], [1, T])
+    if line_search:
+        mech = compose([gm, svt], [1, T])
+    else:
+        mech = gm
     mech.neighboring = "replace_one"
     trial = subsample(mech, subsample_prob, improved_bound_flag=improved_bound_flag)
     return compose([trial], [num_trials])
@@ -398,6 +402,7 @@ class Complex_Mechanism(Mechanism):
             params["T"],
             params["subsample_prob"],
             params["num_trials"],
+            params["line_search"],
         )
         # The following will set the function representation of the complex mechanism
         # to be the same as that of the mech
@@ -408,12 +413,13 @@ general_calibrate = generalized_eps_delta_calibrator()
 
 
 @timeout(seconds=30)
-def calibrate_rho(eps_budget, delta, T, subsample_prob, num_trials):
+def calibrate_rho(eps_budget, delta, T, subsample_prob, line_search, num_trials):
     params = {
         "rho": None,
         "T": T,
         "subsample_prob": subsample_prob,
         "num_trials": num_trials,
+        "line_search": line_search,
     }
     return general_calibrate(
         Complex_Mechanism,
@@ -444,7 +450,7 @@ def estimate_lower_bound(
     subsample_prob = batch_size / n
     ic(eps, delta, T, subsample_prob)
     start = time.perf_counter()
-    mech = calibrate_rho(eps, delta, T, subsample_prob, num_trials)
+    mech = calibrate_rho(eps, delta, T, subsample_prob, optimizer.line_search, num_trials)
     end = time.perf_counter()
     runtime = end - start
     print(f"Running time (lower bound estimation - calibrate rho): {runtime:.2f}s")
@@ -866,11 +872,11 @@ initial_gap = 0.5
 # rho2rdp_map = dict(zip(rhos, eps_lst))
 # print(f"eps={eps:.2f}, rho={rho:.5f}")
 
-def exp_range_eps(eps_lst, strategy_lst, rhos=None, run_dpopt=True, run_dptr=True, wandb_on=True, seed=21):
+def exp_range_eps(eps_lst, strategy_lst, rhos=None, run_dpopt=True, run_dptr=True, wandb_on=True, seed=21, results_save_dir="results"):
     if rhos is None:
         rhos = dp2rdp(eps_lst, 1 / n)
     time_str = datetime.now().strftime("%m%d-%H%M%S")
-    with open(os.path.join("results", f"result-seed={seed}_eps_g={eps_g_target:.2f}_{time_str}.csv"), 'w') as f:
+    with open(os.path.join(results_save_dir, f"result-seed={seed}_eps_g={eps_g_target:.2f}_{time_str}.csv"), 'w') as f:
         f.write("seed,method,eps,rho,completed,loss,grad_norm,runtime,rho_left,num_iter\n")
         if run_dpopt:
             for eps, rho in zip(eps_lst, rhos):
@@ -908,28 +914,30 @@ eps_lst = np.arange(0.1, 1.1, 0.1)[::-1]
 # eps_lst = np.array([0.7])
 delta = 1 / n
 rhos = dp2rdp(eps_lst, delta)
-wandb_on = True
+wandb_on = False
 
+def exp():
+    # strategies = ["adaptive"]
+    # strategies = ["two_phase", "shrink", "adapt_noise", "fixed"]
+    strategies = ["two_phase", "fixed"]
+    # exp_range_eps(eps_lst, strategies, rhos, run_dptr=True, wandb_on=wandb_on, seed=SEED)
+    seeds = [2023, 999, 67, 33, 128]
+    # seeds = [999]
+    for SEED in seeds:
+        # exp_range_eps(eps_lst, strategies, rhos, run_dpopt=False, run_dptr=True, wandb_on=wandb_on, seed=SEED)
+        exp_range_eps(eps_lst, strategies, rhos, run_dpopt=True, run_dptr=False, wandb_on=wandb_on, seed=SEED)
+        # subprocess.run(["wandb", "sync"], check=True)
+        print(f"Done with seed {SEED}\n\n")
+        # wandb.alert(title="Runs finished", text=f"Runs finished for seed={SEED}")
+        # for f in glob.glob("wandb/*/logs/debug-internal.log"):
+        #     os.remove(f)
 
-# strategies = ["adaptive"]
-# strategies = ["two_phase", "shrink", "adapt_noise", "fixed"]
-strategies = ["two_phase", "fixed"]
-# exp_range_eps(eps_lst, strategies, rhos, run_dptr=True, wandb_on=wandb_on, seed=SEED)
-seeds = [2023, 999, 67, 33, 128]
-# seeds = [999]
-for SEED in seeds:
-    # exp_range_eps(eps_lst, strategies, rhos, run_dpopt=False, run_dptr=True, wandb_on=wandb_on, seed=SEED)
-    exp_range_eps(eps_lst, strategies, rhos, run_dpopt=True, run_dptr=False, wandb_on=wandb_on, seed=SEED)
-    # subprocess.run(["wandb", "sync"], check=True)
-    print(f"Done with seed {SEED}\n\n")
-    # wandb.alert(title="Runs finished", text=f"Runs finished for seed={SEED}")
-    # for f in glob.glob("wandb/*/logs/debug-internal.log"):
-    #     os.remove(f)
+# exp()
 # strategy = "adaptive"
 
-# rho = rhos[0]
-# strategy = "adaptive"
-# model, optimizer, results = dpopt_exp(opt_params, strategy, initial_gap=initial_gap, rho=rho, line_search=False, max_iter=2000, print_every=print_every, seed=SEED, wandb_on=wandb_on)
+rho = rhos[0]
+strategy = "adaptive"
+model, optimizer, results = dpopt_exp(opt_params, strategy, initial_gap=initial_gap, rho=rho, line_search=False, max_iter=2000, print_every=print_every, seed=SEED, wandb_on=wandb_on)
 # model, optimizer, results = tr_exp(alpha=eps_g_target, G=1, M=1, initial_gap=initial_gap, rho=rho, print_every=print_every, wandb_on=wandb_on)
 # print(results)
 
