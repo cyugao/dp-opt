@@ -20,7 +20,7 @@ from timeout import TimeoutError
 
 import wandb
 
-WANDB_PROJECT = "covtype-final"
+WANDB_PROJECT = "covtype-iclr"
 
 # %%
 
@@ -714,6 +714,7 @@ def opt_adapt_noise(
 def dpopt_exp(
     opt_params,
     strategy,
+    method_name,
     initial_gap=None,
     rho=1,
     max_iter=1000,
@@ -727,7 +728,7 @@ def dpopt_exp(
         project=WANDB_PROJECT,
         group=f"eps_g={eps_g_target},seed={seed}",
         config={
-            "method": "dpopt-" + strategy,
+            "method": method_name,
             "seed": seed,
             "rho": rho,
             "eps": rdp2dp(rho, 1 / n),
@@ -834,17 +835,19 @@ def tr_exp(
     M,
     initial_gap,
     rho=1,
-    
     print_every=50,
     seed=22,
     wandb_on=True,
 ):
+    method_name = "dptr*"
+    if batch_size:
+        method_name += f"-batch={batch_size}"
     T = int(np.ceil(6 * M**0.5 * initial_gap / alpha**1.5))
     run = wandb.init(
         project=WANDB_PROJECT,
         group=f"eps_g={eps_g_target},seed={seed}",
         config={
-            "method": "dptr*",
+            "method": method_name,
             "seed": seed,
             "rho": rho,
             "eps": rdp2dp(rho, 1 / n),
@@ -960,7 +963,7 @@ def exp_range_eps(eps_lst, strategy_lst, rhos=None, run_dpopt=True, run_dptr=Tru
                         method += '-' + strategy
                         print(f">>>>>\nRunning {method} with rho={rho:.5f} (eps={eps:.2f})")
                         try:
-                            model, optimizer, results = dpopt_exp(opt_params, strategy, initial_gap=initial_gap, rho=rho, max_iter=2000, line_search=ls, print_every=print_every, seed=seed, wandb_on=wandb_on)
+                            model, optimizer, results = dpopt_exp(opt_params, strategy, method, initial_gap=initial_gap, rho=rho, max_iter=2000, line_search=ls, print_every=print_every, seed=seed, wandb_on=wandb_on)
                             print()
                             # write result to file
                             f.write(f"{seed},{method},{eps:.4f},{rho:.5f},{optimizer.completed},{results['loss']:.5f},{results['grad_norm']:.5f},{results['runtime']:.5f},{results['rho_left']:.5f},{results['num_iter']}\n")
@@ -1015,9 +1018,9 @@ def exp(run_dpopt=True, run_dptr=True):
 
 run_dpopt = run_dptr = True
 if len(sys.argv) > 2:
-    if sys.argv[1] == "dpopt":
+    if sys.argv[2] == "dpopt":
         run_dptr = False
-    elif sys.argv[1] == "dptr":
+    elif sys.argv[2] == "dptr":
         run_dpopt = False
 
 exp(run_dpopt, run_dptr)
