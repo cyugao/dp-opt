@@ -33,7 +33,7 @@ class DPOPT(torch.optim.Optimizer):
         self.eps_g = opt_params["eps_g"]
         self.eps_H = opt_params["eps_H"]
         self.gamma_g_init = opt_params["b_g"] * opt_params["gamma_g_bar"]
-        self.qg_scalar = 2 / opt_params["n"] * self.gamma_g_init * opt_params["G"]
+        self.qg_scalar = 2 / opt_params["n"] * self.gamma_g_init * opt_params["B_g"]
         self.gamma_H_init_scalar = (
             opt_params["b_H"] * opt_params["t2"] / opt_params["M"]
         )

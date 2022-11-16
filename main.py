@@ -20,7 +20,12 @@ from timeout import TimeoutError
 
 import wandb
 
-WANDB_PROJECT = "covtype-iclr-28threads"
+if len(sys.argv) > 1:
+    dataset = sys.argv[1]
+else:
+    dataset = "covtype"
+
+WANDB_PROJECT = f"{dataset}-condor-final"
 # WANDB_PROJECT = "test"
 
 # %%
@@ -71,9 +76,13 @@ def load_mnist():
     # )
     return train_set.data, train_set.targets
 
-
-X, y = load_covtype()
-print("Dataset size:", X.shape)
+# dataset = "covtype"
+if dataset == "covtype":
+    X, y = load_covtype()
+elif dataset == "ijcnn":
+    X, y = load_ijcnn()
+print(f"Using dataset {dataset}, size: {X.shape}", )
+print()
 # train test split
 # rng = default_rng(0)
 # indices = rng.choice(len(X), size=50000)
@@ -115,7 +124,7 @@ class ERM(torch.nn.Module):
 
 # Get cpu or gpu device for training.
 device = "cuda" if torch.cuda.is_available() else "cpu"
-print(f"Using {device} device")
+# print(f"Using {device} device")
 
 
 def regularizer(w):
@@ -712,12 +721,12 @@ def opt_adapt_noise(
     return loss, rho, i
 
 def get_opt_method_name(strategy, line_search):
-    method = "DPOPT"
+    method = "dpopt-" + strategy
     if line_search:
-        method += "-LS"
+        method += "-ls"
     if batch_size:
         method += f"-batch={batch_size}"
-    return method + '-' + strategy
+    return method
 
 
 def dpopt_exp(
@@ -733,8 +742,10 @@ def dpopt_exp(
 ):
     eps = rdp2dp(rho, 1 / n)
     method = get_opt_method_name(strategy, line_search)
+    run_name = f"{method}-eps={eps:.1f}-eps_g={eps_g_target:.2f}-seed={seed}"
     run = wandb.init(
         project=WANDB_PROJECT,
+        name=run_name,
         group=f"eps_g={eps_g_target},seed={seed}",
         config={
             "method": method,
@@ -816,6 +827,11 @@ def dpopt_exp(
         loss = model(X, y)
         loss.backward()
     grad_norm = model.w.grad.norm()
+    # evaluate final hessian eigenvalue
+    hess_closure = lambda: torch.autograd.functional.hessian(
+        lambda w: model(X, y, w), model.w
+    )
+    hess_eig, _ = optimizer.smallest_eig(hess_closure())
     print(
         f"Final loss: {loss:.5f}, grad_norm: {grad_norm:.5f}, privacy budget left: {rho_left:.5f}"
     )
@@ -827,6 +843,7 @@ def dpopt_exp(
     results = dict(
         loss=loss,
         grad_norm=grad_norm,
+        hess_eig=hess_eig,
         runtime=runtime,
         rho_left=rho_left,
         num_iter=num_iter+1,
@@ -849,13 +866,15 @@ def dptr_exp(
     seed=22,
     wandb_on=True,
 ):
+    eps = rdp2dp(rho, 1 / n)
     method = "dptr*"
     if batch_size:
         method += f"-batch={batch_size}"
-    eps = rdp2dp(rho, 1 / n)
+    run_name = f"{method}-eps={eps:.1f}-eps_g={eps_g_target:.2f}-seed={seed}"
     T = int(np.ceil(6 * M**0.5 * initial_gap / alpha**1.5))
     run = wandb.init(
         project=WANDB_PROJECT,
+        name=run_name,
         group=f"eps_g={eps_g_target},seed={seed}",
         config={
             "method": method,
@@ -907,6 +926,10 @@ def dptr_exp(
         loss = model(X, y)
         loss.backward()
     grad_norm = model.w.grad.norm()
+    hess_closure = lambda: torch.autograd.functional.hessian(
+        lambda w: model(X, y, w), model.w
+    )
+    hess_eig, _ = optimizer.smallest_eig(hess_closure())
     rho_left = rho * (1 - (i + 1) / T)
     print(
         f"Final loss: {loss:.5f}, grad_norm: {grad_norm:.5f}, privacy budget left: {rho_left:.5f}"
@@ -914,6 +937,7 @@ def dptr_exp(
     results = dict(
         loss=loss,
         grad_norm=grad_norm,
+        hess_eig=hess_eig,
         runtime=runtime,
         rho_left=rho_left,
         num_iter=i+1,
@@ -925,17 +949,21 @@ def dptr_exp(
 
 
 # Note that the DPOPT algorithm outputs a ((1+c1)eps_g, (1+c)eps_H)-approximate second-order necessary point.
-SEED = 888
-eps_g_target = 0.03
-if len(sys.argv) > 1:
-    eps_g_target = float(sys.argv[1])
+seed = 888
+eps_g_target = 0.1
+if len(sys.argv) > 2:
+    eps_g_target = float(sys.argv[2])
+
+if len(sys.argv) > 3:
+    seed = int(sys.argv[3])
 
 # if len(sys.argv) > 1:
 #     SEED = int(sys.argv[1])
 # if len(sys.argv) > 2:
 #     eps_g_target = float(sys.argv[2])
 # eps_g, eps_H = 0.0001, 0.01
-loss_sensitivity, G, M = 1, 1, 1
+loss_sensitivity, B_g, B_H, M = 1, 1, 1, 1
+G = B_H
 
 c2 = 1 / 10
 c1 = c2 / M
@@ -946,7 +974,7 @@ b_g, b_H = 20, 20
 
 # fmt: off
 opt_params = dict(
-    eps_g=eps_g, eps_H=eps_H, n_dim=n_dim, n=n, loss_sensitivity=loss_sensitivity, B_g=1, B_H=1, G=G, M=M, lower_bound=0.3, c=c, c1=c1, c2=1 / 12, b_g=b_g, beta_g=0.6, c_g=0.6, b_H=b_H, beta_H=0.5, c_H=0.25, checked=False,
+    eps_g=eps_g, eps_H=eps_H, n_dim=n_dim, n=n, loss_sensitivity=loss_sensitivity, B_g=B_g, B_H=B_H, G=G, M=M, lower_bound=0.3, c=c, c1=c1, c2=1 / 12, b_g=b_g, beta_g=0.6, c_g=0.6, b_H=b_H, beta_H=0.5, c_H=0.25, checked=False,
 )
 
 check_and_compute_params(opt_params)
@@ -956,22 +984,23 @@ initial_gap = 0.5
 # rho2rdp_map = dict(zip(rhos, eps_lst))
 # print(f"eps={eps:.2f}, rho={rho:.5f}")
 
-def exp_range_eps(eps_lst, strategy_lst, rhos=None, run_dpopt=True, run_dptr=True,  wandb_on=True, seed=21, results_save_dir="results", delete_log=True):
+def exp_range_eps(eps_lst, strategy_lst, rhos=None, run_dpopt=True, run_dptr=True,  wandb_on=True, seed=21, delete_log=True):
     if rhos is None:
         rhos = dp2rdp(eps_lst, 1 / n)
     time_str = datetime.now().strftime("%m%d-%H%M%S")
-    with open(os.path.join(results_save_dir, f"result-seed={seed}_eps_g={eps_g_target:.2f}_{time_str}.csv"), 'w') as f:
-        f.write("seed,method,eps,rho,completed,loss,grad_norm,runtime,rho_left,num_iter\n")
+    with open(f"{dataset}-seed={seed}_eps_g={eps_g_target:.2f}_{time_str}.csv", 'w') as f:
+        f.write("seed,method,eps,rho,completed,loss,grad_norm,hess_eig,runtime,rho_left,num_iter,grad_evals,hess_evals,\n")
         if run_dpopt:
             for eps, rho in zip(eps_lst, rhos):
                 for strategy in strategy_lst:
                     # for ls in [True]:
                     for ls in [True, False]:
                         try:
+                            method = get_opt_method_name(strategy, ls)
                             model, optimizer, results = dpopt_exp(opt_params, strategy, initial_gap=initial_gap, rho=rho, max_iter=2000, line_search=ls, print_every=print_every, seed=seed, wandb_on=wandb_on)
                             print()
                             # write result to file
-                            f.write(f"{seed},{method},{eps:.4f},{rho:.5f},{optimizer.completed},{results['loss']:.5f},{results['grad_norm']:.5f},{results['runtime']:.5f},{results['rho_left']:.5f},{results['num_iter']}\n")
+                            f.write(f"{seed},{method},{eps:.4f},{rho:.5f},{optimizer.completed},{results['loss']:.5f},{results['grad_norm']:.5f},{results['runtime']:.5f},{results['rho_left']:.5f},{results['num_iter']},{results['grad_evals']},{results['hess_evals']}\n")
                         except Exception as e:
                             print(f"seed={seed}, method={method}, eps={eps:.4f}, rho={rho:.5f} failed:\n {str(e)}")
             # model, optimizer = dptr_exp(alpha=eps_g, G=1, M=1, initial_gap=initial_gap, rho=rho, print_every=print_every, wandb_on=wandb_on)
@@ -980,12 +1009,13 @@ def exp_range_eps(eps_lst, strategy_lst, rhos=None, run_dpopt=True, run_dptr=Tru
         if run_dptr:
             print("Running DPTR*...")
             for eps, rho in zip(eps_lst, rhos):
-                method = "DPTR*"
+                method = "DPTR*" + (f"-batch={batch_size}" if batch_size else "")
                 print(f">>>>>\nRunning {method} with rho={rho:.5f} (eps={eps:.2f})")
-                model, optimizer, results = dptr_exp(alpha=eps_g_target, G=1, M=1, initial_gap=initial_gap, rho=rho,  print_every=print_every, seed=seed, wandb_on=wandb_on)
+                model, optimizer, results = dptr_exp(alpha=eps_g_target, G=1, M=1, initial_gap=initial_gap, rho=rho, print_every=print_every, seed=seed, wandb_on=wandb_on)
                 print()
                 # write result to file
                 f.write(f"{seed},{method},{eps:.4f},{rho:.5f},{optimizer.completed},{results['loss']:.5f},{results['grad_norm']:.5f},{results['runtime']:.5f}, {results['rho_left']:.5f},{results['num_iter']}\n")
+
         if delete_log:
             subprocess.run("rm -f wandb/*/logs/debug-internal.log", shell=True)
 
@@ -998,50 +1028,51 @@ eps_lst = np.arange(0.1, 1.1, 0.1)[::-1]
 # eps_lst = np.array([0.7])
 delta = 1 / n
 rhos = dp2rdp(eps_lst, delta)
-wandb_on = False
+# wandb_on = False
 wandb_on = True
 
-def exp(run_dpopt=True, run_dptr=True):
+def exp(run_dpopt=True, run_dptr=True, seed=21):
     global batch_size
     # strategies = ["two_phase", "shrink", "adapt_noise", "fixed"]
-    # strategies = ["fixed"]
+    # strategies = ["two_phase"]
     strategies = ["two_phase", "fixed"]
     # exp_range_eps(eps_lst, strategies, rhos, run_dptr=True, wandb_on=wandb_on, seed=SEED)
-    seeds = [2023, 999, 67, 33, 128]
     # seeds = [999]
-    for SEED in seeds:
-        for batch_size in [None, n // 100, n // 50]:
-            exp_range_eps(eps_lst, strategies, rhos, run_dpopt, run_dptr, wandb_on=wandb_on, seed=SEED, results_save_dir="results/covtype/runs")
-            # subprocess.run(["wandb", "sync"], check=True)
-        print(f"Done with seed {SEED}\n\n")
+        # for batch_size in [None]:
+    for batch_size in [None, n // 100, n // 50]:
+        exp_range_eps(eps_lst, strategies, rhos, run_dpopt, run_dptr, wandb_on=wandb_on, seed=seed)
+        # subprocess.run(["wandb", "sync"], check=True)
+    print(f"Done with seed {seed}\n\n")
         # wandb.alert(title="Runs finished", text=f"Runs finished for seed={SEED}")
         # for f in glob.glob("wandb/*/logs/debug-internal.log"):
         #     os.remove(f)
 
 
 
-run_dpopt = run_dptr = True
-if len(sys.argv) > 2:
-    if sys.argv[2] == "dpopt":
-        run_dptr = False
-    elif sys.argv[2] == "dptr":
-        run_dpopt = False
+exp(seed=seed)
+
+# run_dpopt = run_dptr = True
+# if len(sys.argv) > 2:
+#     if sys.argv[2] == "dpopt":
+#         run_dptr = False
+#     elif sys.argv[2] == "dptr":
+#         run_dpopt = False
 
 # exp(run_dpopt, run_dptr)
 # exp(run_dpopt=False, run_dptr=True)
-exit(0)
+# exit(0)
 
-rho = rhos[-1]
+# rho = rhos[-1]
 # strategy = "two_phase"
 # strategy = "adaptive"
-strategy = "fixed"
+# strategy = "fixed"
 
-batch_size = 5000
-batch_size = None
-line_search = True
-line_search = False
-model, optimizer, results = dpopt_exp(opt_params, strategy, initial_gap=initial_gap, rho=rho, line_search=line_search, max_iter=2000,  print_every=print_every, seed=SEED, wandb_on=wandb_on)
+# batch_size = 5000
+# batch_size = None
+# line_search = True
+# line_search = False
+# model, optimizer, results = dpopt_exp(opt_params, strategy, initial_gap=initial_gap, rho=rho, line_search=line_search, max_iter=2000,  print_every=print_every, seed=SEED, wandb_on=wandb_on)
 # model, optimizer, results = dptr_exp(alpha=eps_g_target, G=1, M=1, initial_gap=initial_gap, rho=rho, print_every=print_every, wandb_on=wandb_on)
-print(results)
+# print(results)
 
 # %%
