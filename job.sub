@@ -1,0 +1,40 @@
++group = "WID"
++WIDsTheme = "Optimization"
+
+executable   = work.sh
+arguments    = $(dataset) $(eps) $(seed)
+
+output       = output/$(dataset)_$(eps)_$(seed).txt
+error        = err_msgs/$(dataset)_$(eps)_$(seed).err
+log          = run.log
+
+should_transfer_files = YES
+preserve_relative_paths = True
+transfer_input_files = main.py, DPOPT.py, DPTR.py, timeout.py, data/covtype.csv, data/ijcnn.csv
+# transfer_output_files = 
+
+requirements = machine=="opt-a002.discovery.wisc.edu" || machine=="opt-a003.discovery.wisc.edu" || machine=="opt-a004.discovery.wisc.edu"
+
+request_cpus = 8
+request_memory = 2GB
+request_disk = 2GB
+
+dataset = ijcnn
+
+eps = 0.06
+queue seed in 2023 999 67 33 128
+
+eps = 0.05
+queue seed in 2023 999 67 33 128
+
+eps = 0.04
+queue seed in 2023 999 67 33 128
+
+eps = 0.03
+queue seed in 2023 999 67 33 128
+
+eps = 0.02
+queue seed in 2023 999 67 33 128
+
+eps = 0.01
+queue seed in 2023 999 67 33 128
