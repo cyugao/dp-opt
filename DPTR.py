@@ -9,7 +9,7 @@ class DPTR(torch.optim.Optimizer):
 
     """Differentially Private Optimization Algorithm"""
 
-    def __init__(self, params, opt_params, rho=1, use_mini_batch=True):
+    def __init__(self, params, opt_params, rho=1, initial_gap=0.5):
 
         # defaults = dict(grad_sigma=grad_sigma, hess_sigma=hess_sigma, eps_g=eps_g, eps_H=eps_H, n_dim=n_dim,
         #                 c=c, c1=c1, c2=c2)
@@ -25,18 +25,16 @@ class DPTR(torch.optim.Optimizer):
         self._params = self.param_groups[0]["params"]
         self.completed = False
         self.rdp_accountant = 0
-        self.mini_batch = use_mini_batch
-        self.T = opt_params["T"]
+        # self.mini_batch = use_mini_batch
         # sigma_g = 2G / n * sqrt(T/phi)
         self.alpha = opt_params["alpha"]
         self.M = opt_params["M"]
         self.n_dim = opt_params["n_dim"]
         self.I = np.eye(self.n_dim)
         self.tr_radius = opt_params["alpha"] / opt_params["M"]
-        self.sigma_g = 2 * opt_params["G"] / opt_params["n"] * (self.T / rho) ** 0.5
-        self.sigma_H = (
-            2 * opt_params["M"] / opt_params["n"] * (self.T * self.n_dim / rho) ** 0.5
-        )
+        self.T = int(np.ceil(6 * self.M**0.5 * initial_gap / self.alpha**1.5))
+        self.sigma_g = (self.T / rho) ** 0.5
+        self.sigma_H = (self.T * self.n_dim / rho) ** 0.5
         self.i = 0
 
     @torch.no_grad()

@@ -150,7 +150,7 @@ class DPOPT(torch.optim.Optimizer):
 
             if lam > -self.eps_H:
                 self.completed = True
-                return FINISHED_STEP, None
+                return FINISHED_STEP, lam
 
             # Negative curvature step
             if not self.line_search:

@@ -1,5 +1,5 @@
 from datetime import datetime
-import os
+import argparse
 import subprocess
 import sys
 import time
@@ -12,6 +12,7 @@ from icecream import ic
 import torch
 torch.set_num_threads(28)
 
+from DPGD import DPGD
 from DPTR import DPTR
 from DPOPT import DPOPT
 from DPOPT import GRADIENT_STEP, CURVATURE_STEP
@@ -20,12 +21,23 @@ from timeout import TimeoutError
 
 import wandb
 
-if len(sys.argv) > 1:
-    dataset = sys.argv[1]
-else:
-    dataset = "covtype"
+def parse_args():
+    # parse dataset, loss_fn, regularizer, eps_g_target and seed
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--dataset", type=str, default="covtype")
+    parser.add_argument("--loss_fn", type=str, default="sigmoid")
+    parser.add_argument("--regularizer", "-reg", type=str, default="l2")
+    parser.add_argument("--eps_g", type=float, default=0.1)
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--wandb", action="store_true")
+    # parse run method
+    parser.add_argument("--method", type=str, default="all")
+    args = parser.parse_args()
+    return args
 
-WANDB_PROJECT = f"{dataset}-condor-final"
+args = parse_args()
+
+WANDB_PROJECT = f"{args.dataset}-{args.loss_fn}"
 # WANDB_PROJECT = "test"
 
 # %%
@@ -62,26 +74,45 @@ def load_ijcnn():
     return X, y
 
 
-def load_mnist():
-    import torchvision as ptv
+# def load_mnist():
+#     from torchvision import datasets, transforms
 
-    train_set = ptv.datasets.MNIST(
-        "./data/mnist/train",
-        train=True,
-        transform=ptv.transforms.ToTensor(),
-        download=True,
-    )
-    # test_set = ptv.datasets.MNIST(
-    #     "./data/mnist/test", train=False, transform=ptv.transforms.ToTensor(), download=True
-    # )
-    return train_set.data, train_set.targets
+#     transform=transforms.Compose([
+#         transforms.ToTensor(),
+#         transforms.Normalize((0.1307,), (0.3081,))
+#         ])
+#     train_set = datasets.MNIST(
+#         "./data/mnist/train",
+#         train=True,
+#         transform=transform,
+#         download=True,
+#     )
+#     # test_set = datasets.MNIST(
+#     #     "./data/mnist/test", train=False, transform=transforms.ToTensor(), download=True
+#     # )
+#     return train_set.data, train_set.targets
+
+def load_mnist():
+    # load Tensor and apply transform from data/mnist.npz
+    data = np.load("data/mnist.npz")
+    X = torch.Tensor(data["x_train"])
+    y = torch.Tensor(data["y_train"])
+    mean, std = 0.1307, 0.3081
+    X = (X / 255 - mean) / (std * 33)
+    X = X.flatten(start_dim=1)
+    y[y < 5] = -1
+    y[y >= 5] = 1
+    return X, y
+    
 
 # dataset = "covtype"
-if dataset == "covtype":
+if args.dataset == "covtype":
     X, y = load_covtype()
-elif dataset == "ijcnn":
+elif args.dataset == "ijcnn":
     X, y = load_ijcnn()
-print(f"Using dataset {dataset}, size: {X.shape}", )
+elif args.dataset == "mnist":
+    X, y = load_mnist()
+print(f"Using dataset {args.dataset}, size: {X.shape}, target eps_g={args.eps_g:.2f}", )
 print()
 # train test split
 # rng = default_rng(0)
@@ -93,9 +124,10 @@ X.shape, y.shape
 
 
 class ERM(torch.nn.Module):
-    def __init__(self, input_dim, regularizer, reg_coef=1e-3):
+    def __init__(self, input_dim, loss_fn, regularizer, reg_coef=1e-3):
         super(ERM, self).__init__()
         self.input_dim = input_dim
+        self.loss_fn = loss_fn
         self.regularizer = regularizer
         self.reg_coef = reg_coef
 
@@ -104,9 +136,8 @@ class ERM(torch.nn.Module):
     def forward(self, X, y, w=None):
         if w is None:
             w = self.w
-        return torch.log1p(
-            torch.exp(-y * (X @ w))
-        ).mean() + self.reg_coef * self.regularizer(w)
+        t = y * (X @ w)
+        return self.loss_fn(t).mean() + self.reg_coef * self.regularizer(w)
 
 
 # class ERM_Multi(torch.nn.Module):
@@ -122,15 +153,26 @@ class ERM(torch.nn.Module):
 #         + self.reg_coef * self.regularizer(w)
 
 
-# Get cpu or gpu device for training.
-device = "cuda" if torch.cuda.is_available() else "cpu"
-# print(f"Using {device} device")
-
-
-def regularizer(w):
+def tukey_regularizer(w):
     w2 = w * w
     return (w2 / (1 + w2)).sum()
 
+def l2_regularizer(w):
+    return .5 * w @ w
+
+if args.regularizer == "l2":
+    regularizer = l2_regularizer
+elif args.regularizer == "tukey":
+    regularizer = tukey_regularizer
+
+if args.loss_fn == "sigmoid":
+    loss_fn = torch.sigmoid
+elif args.loss_fn == "logistic":
+    loss_fn = lambda t: torch.log1p(exp(-t))
+
+# Get cpu or gpu device for training.
+device = "cuda" if torch.cuda.is_available() else "cpu"
+# print(f"Using {device} device")
 
 # %%
 def dp2rdp(eps, delta):
@@ -164,10 +206,6 @@ def check_and_compute_params(opt_params):
     beta_H = opt_params["beta_H"]
     c_H = opt_params["c_H"]
     b_H = opt_params["b_H"]
-
-    opt_params["f_sensitivity"] = opt_params["loss_sensitivity"] / n
-    opt_params["grad_sensitivity"] = 2 * B_g / n
-    opt_params["hess_sensitivity"] = 2 * B_H * n_dim**0.5 / n
 
     assert c1 + c_g < 1
     opt_params["gamma_g_bar"] = 2 * (1 - c1 - c_g) / G
@@ -203,7 +241,7 @@ def dp_estimate_T(opt_params, gap, line_search=True):
     return int(np.ceil(gap / decrease))
 
 
-def one_step(model, optimizer, rng=None, logging=True):
+def one_step(model, optimizer, logging=True):
     if batch_size:
         assert rng is not None
         indices = rng.choice(n, size=batch_size)
@@ -220,12 +258,11 @@ def one_step(model, optimizer, rng=None, logging=True):
     optimizer.step(lambda: model(XX, yy), hess_closure)
     grad_norm = model.w.grad.norm()
     if logging:
-        wandb.log({"loss": loss})
-        wandb.log({"grad_norm": grad_norm})
+        wandb.log({"loss": loss.item(), "grad_norm": grad_norm.item()})
     return loss
 
 
-def one_step_extra(model, optimizer, X, y, logging=True):
+def one_step_extra(model, optimizer, X=X, y=y, logging=True):
     optimizer.zero_grad()
     loss = model(X, y)
     loss.backward()
@@ -235,8 +272,7 @@ def one_step_extra(model, optimizer, X, y, logging=True):
     STEP, noisy_value = optimizer.step(lambda: model(X, y), hess_closure)
     grad_norm = model.w.grad.norm()
     if logging:
-        wandb.log({"loss": loss})
-        wandb.log({"grad_norm": grad_norm})
+        wandb.log({"loss": loss.item(), "grad_norm": grad_norm.item()})
     return loss, (STEP, noisy_value)
 
 
@@ -270,7 +306,7 @@ def opt_shrink_T(
             noisy_loss = (loss + sigma_f_unscaled * torch.randn(1)).item()
 
             if i % print_every == 0:
-                print(f"Iteration {i}: {loss.item():>.5f}")
+                print(f"Iteration {i:>5d}: {loss.item():>.5f}")
 
             if optimizer.completed:
                 print("\nOptimization complete!")
@@ -306,7 +342,6 @@ def opt_two_phase_T(
     init_T,
     max_iter,
     print_every,
-    rng=None,
     fallback_rho_frac=0.25,
 ):
     T = int(init_T ** 0.5) # Just a heuristic
@@ -323,10 +358,10 @@ def opt_two_phase_T(
 
     optimizer.new_epoch_rho(rho_0)
     for i in range(T):
-        loss = one_step(model, optimizer, rng=rng)
+        loss, (STEP, noisy_value) = one_step_extra(model, optimizer)
         if i % print_every == 0:
-            print(f"Iteration {i}: {'mini-batch ' if batch_size else ''}loss={loss.item():>.5f}")
-
+            step_str = "grad_norm" if STEP == GRADIENT_STEP else "hess_eig"
+            print(f"Iteration {i:>5d}: {'mini-batch ' if batch_size else ''}loss={loss.item():>.5f}, {step_str}={noisy_value:.5f}")
         if optimizer.completed:
             print("\nOptimization complete!")
             break
@@ -340,7 +375,7 @@ def opt_two_phase_T(
     rho += fallback_rho
     T = init_T
     if not optimizer.completed:
-        print(f"Entering fallback: remaining privacy budget {rho:.5f}")
+        print(f"Entering fallback: remaining privacy budget {rho:.5f}\n>>>>>")
         rho_0 = rho / T
         if batch_size:
             eps = rdp2dp(rho, 1 / n)
@@ -349,12 +384,26 @@ def opt_two_phase_T(
             print(f"With subsample prob {subsample_prob:.4f}, rho={mech.params['rho']:.5f}")
             print(f"Without subsample prob, rho={rho:.5f}")
         optimizer.new_epoch_rho(rho_0)
+        cur_loss = 100
+        inc_loss_count = 0
         for j in range(min(T, max_iter - i)):
             i += 1
-            loss = one_step(model, optimizer, rng=rng)
-
+            loss, (STEP, noisy_value) = one_step_extra(model, optimizer)
             if i % print_every == 0:
-                print(f"Iteration {i}: {loss.item():>.5f}")
+                step_str = "grad_norm" if STEP == GRADIENT_STEP else "hess_eig"
+                print(f"Iteration {i:>5d}: {'mini-batch ' if batch_size else ''}loss={loss.item():>.5f}, {step_str}={noisy_value:.5f}")
+            if i % 10 == 0 and batch_size is None:
+            # a heuristic to stop early (n is not large enough)
+            # mini-batch loss is not guaranteed to decrease, so we only apply to the full batch case
+                last_loss = cur_loss
+                cur_loss = loss.item()
+                if cur_loss > last_loss:
+                    inc_loss_count += 1
+                    if inc_loss_count >= 3:
+                        print("Loss is increasing. Stopping...")
+                        break
+                else:
+                    inc_loss_count = 0
 
             if optimizer.completed:
                 print("\nOptimization complete!")
@@ -369,7 +418,7 @@ def opt_two_phase_T(
     return loss, rho, i
 
 
-def opt_fixed_T(model, optimizer, rho, init_T, print_every, rng=None):
+def opt_fixed_T(model, optimizer, rho, init_T, print_every):
     T = init_T
     if batch_size:
         subsample_prob = batch_size / n
@@ -384,10 +433,12 @@ def opt_fixed_T(model, optimizer, rho, init_T, print_every, rng=None):
     # Running main loop
     print("\nRunning main loop...")
     cur_loss = 100
+    inc_loss_count = 0
     for i in range(T):
-        loss = one_step(model, optimizer, rng=rng)
+        loss, (STEP, noisy_value) = one_step_extra(model, optimizer)
         if i % print_every == 0:
-            print(f"Iteration {i}: {'mini-batch ' if batch_size else ''}loss={loss.item():>.5f}")
+            step_str = "grad_norm" if STEP == GRADIENT_STEP else "hess_eig"
+            print(f"Iteration {i:>5d}: {'mini-batch ' if batch_size else ''}loss={loss.item():>.5f}, {step_str}={noisy_value:.5f}")
 
         if i % 10 == 0 and batch_size is None:
             # a heuristic to stop early (n is not large enough)
@@ -395,8 +446,12 @@ def opt_fixed_T(model, optimizer, rho, init_T, print_every, rng=None):
             last_loss = cur_loss
             cur_loss = loss.item()
             if cur_loss > last_loss:
-                print("Loss is increasing. Stopping...")
-                break
+                inc_loss_count += 1
+                if inc_loss_count >= 3:
+                    print("Loss is increasing. Stopping...")
+                    break
+            else:
+                inc_loss_count = 0
 
         if optimizer.completed:
             print("\nOptimization complete!")
@@ -510,7 +565,6 @@ def estimate_lower_bound(
     eps_total,
     delta_total,
     T,
-    rng,
     print_every,
     batch_size=5000,
     num_trials=5,
@@ -536,7 +590,7 @@ def estimate_lower_bound(
         #     loss = one_step(model, optimizer, XX, yy)
         #     if j % print_every == 0:
         #         print(
-        #             f"(Trial {i}) Iteration {j}: loss={loss.item():>.5f}, grad_norm={model.w.grad.norm().item():.5f}"
+        #             f"(Trial {i}) Iteration {j}: loss={loss.item():>.5f}, grad_norm={model.w.grad.norm():.5f}"
         #         )
         #     if optimizer.completed:
         #         # rho_left += rho_0 * (T - j - 1) / T
@@ -562,7 +616,6 @@ def opt_adapt_T(
     max_iter,
     print_every,
     estimate_T_closure,
-    rng,
     update_T_every=100,
     estimate_lb=False,
 ):
@@ -582,7 +635,6 @@ def opt_adapt_T(
                 eps1,
                 delta1,
                 init_T,
-                rng,
                 print_every,
                 batch_size=5000,
                 num_trials=5,
@@ -620,7 +672,7 @@ def opt_adapt_T(
             # XX, yy = XX.to(device), yy.to(device)
             loss = one_step(model, optimizer)
             if i % print_every == 0:
-                print(f"Iteration {i}: {loss.item():>.5f}")
+                print(f"Iteration {i:>5d}: {loss.item():>.5f}")
 
             if optimizer.completed:
                 print("\nOptimization complete!")
@@ -682,7 +734,7 @@ def opt_adapt_noise(
             # XX, yy = XX.to(device), yy.to(device)
             loss, (STEP, noisy_value) = one_step_extra(model, optimizer, X, y, logging=logging)
             if i % print_every == 0:
-                print(f"Iteration {i}: {loss.item():>.5f}")
+                print(f"Iteration {i:>5d}: {loss.item():>.5f}")
 
             if optimizer.completed:
                 print("\nOptimization complete!")
@@ -737,35 +789,34 @@ def dpopt_exp(
     max_iter=1000,
     line_search=True,
     print_every=50,
-    seed=22,
-    wandb_on=True,
 ):
     eps = rdp2dp(rho, 1 / n)
     method = get_opt_method_name(strategy, line_search)
-    run_name = f"{method}-eps={eps:.1f}-eps_g={eps_g_target:.2f}-seed={seed}"
+    run_name = f"{method}-eps={eps:.1f}-eps_g={args.eps_g:.2f}-seed={args.seed}"
     run = wandb.init(
         project=WANDB_PROJECT,
         name=run_name,
-        group=f"eps_g={eps_g_target},seed={seed}",
+        group=f"eps_g={args.eps_g},seed={args.seed}",
         config={
             "method": method,
-            "seed": seed,
+            "seed": args.seed,
             "rho": rho,
             "eps": eps,
             "max_iter": max_iter,
             "line_search": line_search,
-            "eps_g": eps_g_target,
-            "eps_H": eps_g_target ** 0.5,
+            "eps_g": args.eps_g,
+            "eps_H": args.eps_g ** 0.5,
             "params": opt_params,
         },
-        mode="online" if wandb_on else "disabled",
+        mode="online" if args.wandb else "disabled",
         reinit=True,
     )
-    print(f">>>>>\nRunning {method} with rho={rho:.5f} (eps={eps:.2f}), seed={seed}\n")
-    torch.manual_seed(seed)
-    model = ERM(opt_params["n_dim"], regularizer)
+    print(f">>>>>\nRunning {method} with rho={rho:.5f} (eps={eps:.2f}), seed={args.seed}\n")
+    global rng
+    rng = default_rng(args.seed)
+    torch.manual_seed(args.seed)
+    model = ERM(opt_params["n_dim"], loss_fn, regularizer)
     optimizer = DPOPT(model.parameters(), opt_params, line_search=line_search)
-    rng = default_rng(seed) if batch_size else None
     full_loss_closure = lambda: model(X, y).item()
     if initial_gap:
         gap = initial_gap
@@ -797,7 +848,6 @@ def dpopt_exp(
             max_iter,
             print_every,
             estimate_T_closure,
-            rng,
             estimate_lb=True,
         )
     elif strategy == "adapt_noise":
@@ -810,10 +860,10 @@ def dpopt_exp(
         )
     elif strategy == "two_phase":
         out = opt_two_phase_T(
-            model, optimizer, rho, init_T, max_iter, print_every, rng=rng
+            model, optimizer, rho, init_T, max_iter, print_every
         )
     elif strategy == "fixed":
-        out = opt_fixed_T(model, optimizer, rho, init_T, print_every, rng=rng)
+        out = opt_fixed_T(model, optimizer, rho, init_T, print_every)
     else:
         raise ValueError(f"Unknown strategy: {strategy}")
     loss, rho_left, num_iter = out
@@ -833,7 +883,7 @@ def dpopt_exp(
     )
     hess_eig, _ = optimizer.smallest_eig(hess_closure())
     print(
-        f"Final loss: {loss:.5f}, grad_norm: {grad_norm:.5f}, privacy budget left: {rho_left:.5f}"
+        f"Final loss: {loss:.5f}, grad_norm: {grad_norm:.5f}, hess_eig: {hess_eig:.5f} privacy budget left: {rho_left:.5f}"
     )
     # number of grad and hess evals
     print(
@@ -841,8 +891,8 @@ def dpopt_exp(
     )
     # store loss, grad_norm, runtime in dictionary
     results = dict(
-        loss=loss,
-        grad_norm=grad_norm,
+        loss=loss.item(),
+        grad_norm=grad_norm.item(),
         hess_eig=hess_eig,
         runtime=runtime,
         rho_left=rho_left,
@@ -857,66 +907,52 @@ def dpopt_exp(
 
 
 def dptr_exp(
-    alpha,
-    G,
-    M,
+    opt_params,
+    rho,
     initial_gap,
-    rho=1,
     print_every=50,
-    seed=22,
-    wandb_on=True,
 ):
     eps = rdp2dp(rho, 1 / n)
     method = "dptr*"
     if batch_size:
         method += f"-batch={batch_size}"
-    run_name = f"{method}-eps={eps:.1f}-eps_g={eps_g_target:.2f}-seed={seed}"
-    T = int(np.ceil(6 * M**0.5 * initial_gap / alpha**1.5))
+    run_name = f"{method}-eps={eps:.1f}-eps_g={args.eps_g:.2f}-seed={args.seed}"
     run = wandb.init(
         project=WANDB_PROJECT,
         name=run_name,
-        group=f"eps_g={eps_g_target},seed={seed}",
+        group=f"eps_g={args.eps_g},seed={args.seed}",
         config={
             "method": method,
-            "seed": seed,
+            "seed": args.seed,
             "rho": rho,
             "eps": eps,
-            "eps_g": eps_g_target,
-            "eps_H": eps_g_target ** 0.5,
-            "max_iter": T,
+            "eps_g": args.eps_g,
+            "eps_H": args.eps_g ** 0.5,
         },
-        mode="online" if wandb_on else "disabled",
+        mode="online" if args.wandb else "disabled",
         reinit=True,
     )
-    print(f">>>>>\nRunning {method} with rho={rho:.5f} (eps={eps:.2f}), seed={seed}\n")
-    torch.manual_seed(seed)
-    rng = default_rng(seed) if batch_size else None
-    
-    model = ERM(n_dim, regularizer)
-    # full_loss_closure = lambda: model(X, y).item()
-    print(f"Optimize for at most T={T} iterations")
+    print(f">>>>>\nRunning {method} with rho={rho:.5f} (eps={eps:.2f}), seed={args.seed}\n")
+    global rng
+    rng = default_rng(args.seed)
+    torch.manual_seed(args.seed)
+    model = ERM(n_dim, loss_fn, regularizer)
 
-    opt_tr_params = {
-        "alpha": alpha,
-        "G": G,
-        "M": M,
-        "n": n,
-        "n_dim": n_dim,
-        "grad_sensitivity": G,
-        "hess_sensitivity": M,
-        "T": T,
-    }
-    print(opt_tr_params)
-    optimizer = DPTR(model.parameters(), opt_tr_params, rho=rho)
+    # full_loss_closure = lambda: model(X, y).item()
+    optimizer = DPTR(model.parameters(), opt_params, rho, initial_gap)
+    T = optimizer.T
+    wandb.config.max_iter = T
+    print(opt_params)
+    print(f"\nOptimize for at most T={T} iterations")
     start = time.perf_counter()
     for i in range(T):
-        loss = one_step(model, optimizer, rng=rng)
+        loss = one_step(model, optimizer)
 
         if optimizer.completed:
             print("\nOptimization complete!")
             break
         if i % print_every == 0:
-            print(f"Iteration {i}: {loss.item():.5f}")
+            print(f"Iteration {i:>4d}: {loss.item():.5f}")
     end = time.perf_counter()
     runtime = end - start
     print(f"Running time: {runtime:.2f}s")
@@ -932,49 +968,133 @@ def dptr_exp(
     hess_eig, _ = optimizer.smallest_eig(hess_closure())
     rho_left = rho * (1 - (i + 1) / T)
     print(
-        f"Final loss: {loss:.5f}, grad_norm: {grad_norm:.5f}, privacy budget left: {rho_left:.5f}"
+        f"Final loss: {loss:.5f}, grad_norm: {grad_norm:.5f}, hess_eig: {hess_eig:.5f} privacy budget left: {rho_left:.5f}"
+    )
+    evals = i + 1
+    print(
+        f"Number of grad, hess evals: {evals}, {evals}"
     )
     results = dict(
-        loss=loss,
-        grad_norm=grad_norm,
+        loss=loss.item(),
+        grad_norm=grad_norm.item(),
         hess_eig=hess_eig,
         runtime=runtime,
         rho_left=rho_left,
-        num_iter=i+1,
+        num_iter=evals,
+        grad_evals=evals,
+        hess_evals=evals,
         completed=optimizer.completed,
     )
     run.summary.update(results)
     run.finish()
     return model, optimizer, results
 
+def dpgd_exp(
+    opt_params,
+    eps,
+    initial_gap,
+    print_every=50,
+):
+    method = "dpgd*"
+    delta = 1 / n
+    if batch_size:
+        method += f"-batch={batch_size}"
+    run_name = f"{method}-eps={eps:.1f}-eps_g={args.eps_g:.2f}-seed={args.seed}"
+    run = wandb.init(
+        project=WANDB_PROJECT,
+        name=run_name,
+        group=f"eps_g={args.eps_g},seed={args.seed}",
+        config={
+            "method": method,
+            "seed": args.seed,
+            "eps": eps,
+            "delta": delta,
+            "eps_g": args.eps_g,
+            "eps_H": args.eps_g ** 0.5,
+        },
+        mode="online" if args.wandb else "disabled",
+        reinit=True,
+    )
+    print(f">>>>>\nRunning {method} with alpha={args.eps_g:.5f} (eps={eps:.2f}), seed={args.seed}\n")
+    global rng
+    rng = default_rng(args.seed)
+    torch.manual_seed(args.seed)
+    
+    model = ERM(n_dim, loss_fn, regularizer)
+    # full_loss_closure = lambda: model(X, y).item()
+    optimizer = DPGD(model.parameters(), opt_params, eps, delta, initial_gap)
+    T = optimizer.T
+    opt_params["T"] = T
+    wandb.config.max_iter = T
+    print(opt_params)
+    print(f"\nOptimize for at most T={T} iterations")
+    start = time.perf_counter()
+    for i in range(T):
+        loss = one_step(model, optimizer)
+
+        if optimizer.completed:
+            print("\nOptimization complete!")
+            break
+        if i % print_every == 0:
+            print(f"Iteration {i:>5d}: {loss.item():.5f}")
+    end = time.perf_counter()
+    runtime = end - start
+    print(f"Running time: {runtime:.2f}s")
+    if batch_size:
+        # compute the loss on the full dataset
+        optimizer.zero_grad()
+        loss = model(X, y)
+        loss.backward()
+    grad_norm = model.w.grad.norm()
+    hess_closure = lambda: torch.autograd.functional.hessian(
+        lambda w: model(X, y, w), model.w
+    )
+    hess_eig, _ = optimizer.smallest_eig(hess_closure())
+    #TODO: compute rho_left
+    rho_left = np.nan
+    # rho_left = rho * (1 - (i + 1) / T)
+    # print(
+    #     f"Final loss: {loss:.5f}, grad_norm: {grad_norm:.5f}, hess_eig: {hess_eig:.5f} privacy budget left: {rho_left:.5f}"
+    # )
+    print(
+        f"Final loss: {loss:.5f}, grad_norm: {grad_norm:.5f}, hess_eig: {hess_eig:.5f}"
+    )
+    print(
+        f"Number of grad, hess evals: {optimizer.grad_evals}, {optimizer.hess_evals}"
+    )
+    results = dict(
+        loss=loss.item(),
+        grad_norm=grad_norm.item(),
+        hess_eig=hess_eig,
+        runtime=runtime,
+        rho_left=rho_left,
+        num_iter=i+1,
+        grad_evals=optimizer.grad_evals,
+        hess_evals=optimizer.hess_evals,
+        completed=optimizer.completed,
+    )
+    run.summary.update(results)
+    run.finish()
+    return model, optimizer, results 
 
 # Note that the DPOPT algorithm outputs a ((1+c1)eps_g, (1+c)eps_H)-approximate second-order necessary point.
-seed = 888
-eps_g_target = 0.1
-if len(sys.argv) > 2:
-    eps_g_target = float(sys.argv[2])
 
-if len(sys.argv) > 3:
-    seed = int(sys.argv[3])
-
-# if len(sys.argv) > 1:
-#     SEED = int(sys.argv[1])
-# if len(sys.argv) > 2:
-#     eps_g_target = float(sys.argv[2])
-# eps_g, eps_H = 0.0001, 0.01
-loss_sensitivity, B_g, B_H, M = 1, 1, 1, 1
+B_f, B_g, B_H, M = 1, 1, 1, 1
 G = B_H
 
 c2 = 1 / 10
 c1 = c2 / M
 c = 1 / 10
-eps_g, eps_H = eps_g_target / (1 + c1), eps_g_target**0.5 / (1 + c)
+eps_g, eps_H = args.eps_g / (1 + c1), (M * args.eps_g)**0.5 / (1 + c)
 # b_g, b_H = 10, 10
 b_g, b_H = 20, 20
 
 # fmt: off
 opt_params = dict(
-    eps_g=eps_g, eps_H=eps_H, n_dim=n_dim, n=n, loss_sensitivity=loss_sensitivity, B_g=B_g, B_H=B_H, G=G, M=M, lower_bound=0.3, c=c, c1=c1, c2=1 / 12, b_g=b_g, beta_g=0.6, c_g=0.6, b_H=b_H, beta_H=0.5, c_H=0.25, checked=False,
+    alpha=args.eps_g, eps_g=eps_g, eps_H=eps_H, n_dim=n_dim, n=n, B_f=B_f, B_g=B_g, B_H=B_H, G=G, M=M, lower_bound=0.3, c=c, c1=c1, c2=1 / 12, b_g=b_g, beta_g=0.6, c_g=0.6, b_H=b_H, beta_H=0.5, c_H=0.25, checked=False,
+    f_sensitivity = B_f / n,
+    grad_sensitivity = 2 * B_g / n,
+    hess_sensitivity = 2 * B_H * n_dim**0.5 / n,
 )
 
 check_and_compute_params(opt_params)
@@ -984,26 +1104,26 @@ initial_gap = 0.5
 # rho2rdp_map = dict(zip(rhos, eps_lst))
 # print(f"eps={eps:.2f}, rho={rho:.5f}")
 
-def exp_range_eps(eps_lst, strategy_lst, rhos=None, run_dpopt=True, run_dptr=True,  wandb_on=True, seed=21, delete_log=True):
+def exp_range_eps(eps_lst, strategy_lst, rhos=None, run_dpopt=True, run_dptr=True, run_dpgd=False, delete_log=False):
     if rhos is None:
         rhos = dp2rdp(eps_lst, 1 / n)
     time_str = datetime.now().strftime("%m%d-%H%M%S")
-    with open(f"{dataset}-seed={seed}_eps_g={eps_g_target:.2f}_{time_str}.csv", 'w') as f:
+    with open(f"{args.dataset}-seed={args.seed}_eps_g={args.eps_g:.2f}_{time_str}.csv", 'w') as f:
         f.write("seed,method,eps,rho,completed,loss,grad_norm,hess_eig,runtime,rho_left,num_iter,grad_evals,hess_evals,\n")
         if run_dpopt:
             for eps, rho in zip(eps_lst, rhos):
                 for strategy in strategy_lst:
                     # for ls in [True]:
                     for ls in [True, False]:
-                        try:
-                            method = get_opt_method_name(strategy, ls)
-                            model, optimizer, results = dpopt_exp(opt_params, strategy, initial_gap=initial_gap, rho=rho, max_iter=2000, line_search=ls, print_every=print_every, seed=seed, wandb_on=wandb_on)
-                            print()
-                            # write result to file
-                            f.write(f"{seed},{method},{eps:.4f},{rho:.5f},{optimizer.completed},{results['loss']:.5f},{results['grad_norm']:.5f},{results['runtime']:.5f},{results['rho_left']:.5f},{results['num_iter']},{results['grad_evals']},{results['hess_evals']}\n")
-                        except Exception as e:
-                            print(f"seed={seed}, method={method}, eps={eps:.4f}, rho={rho:.5f} failed:\n {str(e)}")
-            # model, optimizer = dptr_exp(alpha=eps_g, G=1, M=1, initial_gap=initial_gap, rho=rho, print_every=print_every, wandb_on=wandb_on)
+                        # try:
+                        method = get_opt_method_name(strategy, ls)
+                        model, optimizer, results = dpopt_exp(opt_params, strategy, initial_gap=initial_gap, rho=rho, max_iter=2000, line_search=ls, print_every=print_every)
+                        print()
+                        # write result to file
+                        f.write(f"{args.seed},{method},{eps:.4f},{rho:.5f},{optimizer.completed},{results['loss']:.5f},{results['grad_norm']:.5f},{results['hess_eig']:.5f},{results['runtime']:.5f},{results['rho_left']:.5f},{results['num_iter']},{results['grad_evals']},{results['hess_evals']}\n")
+                        # except Exception as e:
+                        #     print(f"seed={args.seed}, method={method}, eps={eps:.4f}, rho={rho:.5f} failed:\n {str(e)}")
+            # model, optimizer = dptr_exp(opt_params initial_gap=initial_gap, rho=rho, print_every=print_every)
         if delete_log:
             subprocess.run("rm -f wandb/*/logs/debug-internal.log", shell=True)
         if run_dptr:
@@ -1011,10 +1131,19 @@ def exp_range_eps(eps_lst, strategy_lst, rhos=None, run_dpopt=True, run_dptr=Tru
             for eps, rho in zip(eps_lst, rhos):
                 method = "DPTR*" + (f"-batch={batch_size}" if batch_size else "")
                 print(f">>>>>\nRunning {method} with rho={rho:.5f} (eps={eps:.2f})")
-                model, optimizer, results = dptr_exp(alpha=eps_g_target, G=1, M=1, initial_gap=initial_gap, rho=rho, print_every=print_every, seed=seed, wandb_on=wandb_on)
+                model, optimizer, results = dptr_exp(opt_params, rho=rho, initial_gap=initial_gap, print_every=print_every)
                 print()
                 # write result to file
-                f.write(f"{seed},{method},{eps:.4f},{rho:.5f},{optimizer.completed},{results['loss']:.5f},{results['grad_norm']:.5f},{results['runtime']:.5f}, {results['rho_left']:.5f},{results['num_iter']}\n")
+                f.write(f"{args.seed},{method},{eps:.4f},{rho:.5f},{optimizer.completed},{results['loss']:.5f},{results['grad_norm']:.5f},{results['hess_eig']:.5f},{results['runtime']:.5f}, {results['rho_left']:.5f},{results['num_iter']},{results['grad_evals']},{results['hess_evals']}\n")
+        if run_dpgd:
+            print("Running DPGD...")
+            for eps, rho in zip(eps_lst, rhos):
+                method = "DPGD" + (f"-batch={batch_size}" if batch_size else "")
+                print(f">>>>>\nRunning {method} with rho={rho:.5f} (eps={eps:.2f})")
+                model, optimizer, results = dpgd_exp(opt_params, eps, initial_gap=initial_gap, print_every=print_every)
+                print()
+                # write result to file
+                f.write(f"{args.seed},{method},{eps:.4f},{rho:.5f},{optimizer.completed},{results['loss']:.5f},{results['grad_norm']:.5f},{results['hess_eig']:.5f},{results['runtime']:.5f}, {results['rho_left']:.5f},{results['num_iter']},{results['grad_evals']},{results['hess_evals']}\n")
 
         if delete_log:
             subprocess.run("rm -f wandb/*/logs/debug-internal.log", shell=True)
@@ -1028,51 +1157,51 @@ eps_lst = np.arange(0.1, 1.1, 0.1)[::-1]
 # eps_lst = np.array([0.7])
 delta = 1 / n
 rhos = dp2rdp(eps_lst, delta)
-# wandb_on = False
-wandb_on = True
 
-def exp(run_dpopt=True, run_dptr=True, seed=21):
+def exp(batch_sizes, run_dpopt=True, run_dptr=False, run_dpgd=False):
     global batch_size
     # strategies = ["two_phase", "shrink", "adapt_noise", "fixed"]
     # strategies = ["two_phase"]
     strategies = ["two_phase", "fixed"]
-    # exp_range_eps(eps_lst, strategies, rhos, run_dptr=True, wandb_on=wandb_on, seed=SEED)
+    # exp_range_eps(eps_lst, strategies, rhos, run_dptr=True)
     # seeds = [999]
         # for batch_size in [None]:
-    for batch_size in [None, n // 100, n // 50]:
-        exp_range_eps(eps_lst, strategies, rhos, run_dpopt, run_dptr, wandb_on=wandb_on, seed=seed)
+    for batch_size in batch_sizes:
+        exp_range_eps(eps_lst, strategies, rhos, run_dpopt, run_dptr, run_dpgd)
         # subprocess.run(["wandb", "sync"], check=True)
-    print(f"Done with seed {seed}\n\n")
+    print(f"Done with seed {args.seed}\n\n")
         # wandb.alert(title="Runs finished", text=f"Runs finished for seed={SEED}")
         # for f in glob.glob("wandb/*/logs/debug-internal.log"):
         #     os.remove(f)
 
+batch_sizes = [None, n // 100, n // 50]
+# batch_sizes = [None]
+# exp(batch_sizes, run_dpopt=False, run_dptr=False, run_dpgd=True)
 
-
-exp(seed=seed)
-
-# run_dpopt = run_dptr = True
-# if len(sys.argv) > 2:
-#     if sys.argv[2] == "dpopt":
-#         run_dptr = False
-#     elif sys.argv[2] == "dptr":
-#         run_dpopt = False
+if args.method == "all":
+    exp(batch_sizes, run_dpopt=True, run_dptr=True)
+elif args.method == "dpopt":
+    exp(batch_sizes, run_dpopt=True, run_dptr=False)
+elif args.method == "dptr":
+    exp(batch_sizes, run_dpopt=False, run_dptr=True)
 
 # exp(run_dpopt, run_dptr)
 # exp(run_dpopt=False, run_dptr=True)
-# exit(0)
+exit(0)
 
-# rho = rhos[-1]
-# strategy = "two_phase"
-# strategy = "adaptive"
-# strategy = "fixed"
+rho = rhos[0]
+eps = eps_lst[0]
+strategy = "adaptive"
+strategy = "fixed"
+strategy = "two_phase"
 
-# batch_size = 5000
-# batch_size = None
-# line_search = True
-# line_search = False
-# model, optimizer, results = dpopt_exp(opt_params, strategy, initial_gap=initial_gap, rho=rho, line_search=line_search, max_iter=2000,  print_every=print_every, seed=SEED, wandb_on=wandb_on)
-# model, optimizer, results = dptr_exp(alpha=eps_g_target, G=1, M=1, initial_gap=initial_gap, rho=rho, print_every=print_every, wandb_on=wandb_on)
-# print(results)
+batch_size = 5000
+batch_size = None
+line_search = False
+line_search = True
+model, optimizer, results = dpopt_exp(opt_params, strategy, initial_gap=initial_gap, rho=rho, line_search=line_search, max_iter=2000,  print_every=print_every)
+# model, optimizer, results = dptr_exp(opt_params, rho=rho, initial_gap=initial_gap, print_every=print_every)
+# model, optimizer, results = dpgd_exp(opt_params, eps, initial_gap, print_every=print_every)
+print(results)
 
 # %%
